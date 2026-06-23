@@ -34,5 +34,7 @@ The goal is to determine whether a player's recent success influences future per
 ## Author
 
 Shenwei Zhang (Vicky)
+
 Statistics Graduate Student @ UC Berkeley
+
 B.S. in Statistics, The Ohio State University

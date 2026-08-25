@@ -1,0 +1,1170 @@
+---
+title: "mlb-data-codebook"
+author: "vicky zhang 12878"
+date: "2026-08-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Michael Harris II Statcast Data Codebook
+
+## 1. Dataset Overview
+
+**Dataset:** Baseball Savant / Statcast pitch-level data for Michael Harris II
+**Seasons included:** 2022–2025
+**Number of rows:** 7,471
+**Number of variables:** 118
+
+### Most Important Structural Point
+
+Each row represents **one pitch**, not one at-bat.
+
+For example, one at-bat may contain:
+
+* Pitch 1: called strike
+* Pitch 2: ball
+* Pitch 3: foul
+* Pitch 4: single
+
+All four pitches appear as four separate rows.
+
+Therefore:
+
+$$
+\text{Pitch-level data}
+\neq
+\text{At-bat-level data}
+$$
+
+For the streak analysis, the dataset will later need to be collapsed to one row per completed batting event.
+
+---
+
+# 2. Identification Variables
+
+## `game_date`
+
+**Meaning:** Date of the game.
+
+Example:
+
+```text
+9/28/2025
+```
+
+**Use in this project:**
+
+* Sort observations chronologically
+* Construct season timelines
+* Plot rolling performance
+
+---
+
+## `game_year`
+
+**Meaning:** MLB season.
+
+Values in this dataset:
+
+```text
+2022
+2023
+2024
+2025
+```
+
+**Use:**
+
+* Analyze each season separately
+* Estimate season-specific batting probability
+* Run separate Monte Carlo simulations
+
+---
+
+## `game_pk`
+
+**Meaning:** Unique MLB game identifier.
+
+Example:
+
+```text
+776149
+```
+
+Multiple pitches from the same game share the same `game_pk`.
+
+**Use:**
+
+* Identify games
+* Combine with `at_bat_number` to uniquely identify a batting appearance within a game
+
+---
+
+## `player_name`
+
+**Meaning:** Batter name.
+
+In this dataset:
+
+```text
+Harris II, Michael
+```
+
+---
+
+## `batter`
+
+**Meaning:** MLB numerical ID for Michael Harris II.
+
+In this dataset:
+
+```text
+671739
+```
+
+---
+
+## `pitcher`
+
+**Meaning:** MLB ID of the pitcher who threw the pitch.
+
+**Use:**
+
+Potential pitcher-behavior analysis.
+
+---
+
+# 3. At-Bat / Pitch Sequence Variables
+
+## `at_bat_number`
+
+**Meaning:** Sequential plate appearance / at-bat number within the game record.
+
+Example:
+
+```text
+31
+```
+
+All pitches belonging to the same batting sequence generally share the same:
+
+```text
+game_pk + at_bat_number
+```
+
+This combination is therefore extremely useful for converting the pitch-level dataset into a plate-appearance-level dataset.
+
+---
+
+## `pitch_number`
+
+**Meaning:** Pitch number within the current plate appearance.
+
+Example:
+
+```text
+1
+2
+3
+4
+```
+
+Suppose one plate appearance contains:
+
+```text
+pitch_number = 1
+pitch_number = 2
+pitch_number = 3
+pitch_number = 4
+```
+
+Then pitch 4 is the fourth pitch of that plate appearance.
+
+---
+
+## `balls`
+
+**Meaning:** Number of balls **before the current pitch**.
+
+Values:
+
+```text
+0, 1, 2, 3
+```
+
+---
+
+## `strikes`
+
+**Meaning:** Number of strikes **before the current pitch**.
+
+Values:
+
+```text
+0, 1, 2
+```
+
+---
+
+## `outs_when_up`
+
+**Meaning:** Number of outs when Harris came to bat / when the pitch occurred.
+
+Possible values:
+
+```text
+0
+1
+2
+```
+
+---
+
+# 4. Plate-Appearance Outcome Variables
+
+These are especially important for the streak analysis.
+
+## `events`
+
+**Meaning:** Final result of a completed plate appearance.
+
+Unlike many other columns, `events` is generally only populated on the **final pitch of a plate appearance**.
+
+Observed values in this dataset include:
+
+```text
+single
+double
+triple
+home_run
+field_out
+force_out
+strikeout
+walk
+field_error
+sac_fly
+hit_by_pitch
+fielders_choice
+grounded_into_double_play
+double_play
+sac_bunt
+fielders_choice_out
+truncated_pa
+```
+
+### Hit outcomes
+
+For a batting-average-based definition:
+
+```text
+single
+double
+triple
+home_run
+```
+
+are hits.
+
+So:
+
+$$
+Hit =
+\begin{cases}
+1 & single,\ double,\ triple,\ home\ run\
+0 & eligible\ non-hit\ AB
+\end{cases}
+$$
+
+### Important
+
+Not every non-hit `events` value should automatically become `0` for batting average.
+
+For example:
+
+```text
+walk
+hit_by_pitch
+sac_fly
+```
+
+normally do **not** count as official at-bats in batting average.
+
+Therefore the correct workflow is not:
+
+```r
+ifelse(hit, 1, 0)
+```
+
+for every plate appearance.
+
+Instead, we first need to determine whether the outcome counts as an official AB.
+
+---
+
+## `description`
+
+**Meaning:** Outcome of the individual pitch.
+
+Observed examples:
+
+```text
+ball
+called_strike
+swinging_strike
+foul
+hit_into_play
+foul_tip
+blocked_ball
+hit_by_pitch
+pitchout
+```
+
+### Difference between `description` and `events`
+
+This distinction is crucial.
+
+`description` answers:
+
+> What happened on this pitch?
+
+`events` answers:
+
+> How did the entire plate appearance end?
+
+Example:
+
+```text
+Pitch 1:
+description = called_strike
+events = NA
+
+Pitch 2:
+description = ball
+events = NA
+
+Pitch 3:
+description = hit_into_play
+events = single
+```
+
+For your streak analysis:
+
+**Use `events`, not `description`, to define hit / non-hit outcomes.**
+
+---
+
+## `type`
+
+**Meaning:** Broad pitch result classification.
+
+Values:
+
+```text
+B
+S
+X
+```
+
+Typically:
+
+* `B` = ball
+* `S` = strike
+* `X` = ball put into play
+
+This is useful for pitch-level analysis but is too coarse to define batting success.
+
+---
+
+## `des`
+
+**Meaning:** Human-readable description of the baseball play.
+
+Example:
+
+```text
+Michael Harris II singles on a ground ball to first baseman ...
+```
+
+Useful for checking individual observations manually, but usually not needed for statistical modeling.
+
+---
+
+# 5. Batter / Pitcher Handedness
+
+## `stand`
+
+**Meaning:** Batter handedness.
+
+For Harris in this dataset:
+
+```text
+L
+```
+
+Michael Harris II bats left-handed.
+
+---
+
+## `p_throws`
+
+**Meaning:** Pitcher throwing hand.
+
+Values:
+
+```text
+R
+L
+```
+
+This allows comparison between:
+
+* left-handed pitchers
+* right-handed pitchers
+
+Potential future analysis:
+
+$$
+Performance \mid LHP
+\quad vs \quad
+Performance \mid RHP
+$$
+
+---
+
+# 6. Pitch Type Variables
+
+## `pitch_type`
+
+**Meaning:** Statcast abbreviation for pitch type.
+
+Important examples:
+
+| Code | Meaning            |
+| ---- | ------------------ |
+| `FF` | Four-Seam Fastball |
+| `SI` | Sinker             |
+| `FC` | Cutter             |
+| `SL` | Slider             |
+| `ST` | Sweeper            |
+| `CU` | Curveball          |
+| `KC` | Knuckle Curve      |
+| `CH` | Changeup           |
+| `FS` | Split-Finger       |
+
+Other rare pitch types also appear.
+
+---
+
+## `pitch_name`
+
+**Meaning:** Full descriptive pitch name.
+
+Examples:
+
+```text
+4-Seam Fastball
+Changeup
+Slider
+Curveball
+Sinker
+Sweeper
+Split-Finger
+```
+
+### `pitch_type` vs `pitch_name`
+
+They describe essentially the same concept.
+
+For analysis:
+
+* `pitch_type` is shorter and easier to code with
+* `pitch_name` is easier to read in tables and figures
+
+---
+
+# 7. Pitch Velocity
+
+## `release_speed`
+
+**Meaning:** Pitch velocity at release, approximately in mph.
+
+Example:
+
+```text
+96.2
+```
+
+**Use in this project:**
+
+Compare whether pitchers throw harder during Harris's:
+
+* Hot periods
+* Neutral periods
+* Cold periods
+
+---
+
+## `effective_speed`
+
+**Meaning:** Effective perceived pitch velocity, incorporating factors such as release extension.
+
+This is not exactly the same as radar-gun `release_speed`.
+
+For the initial project, `release_speed` is easier to interpret.
+
+---
+
+## `release_extension`
+
+**Meaning:** How far toward home plate the pitcher releases the ball.
+
+Greater extension can make the pitch effectively reach the batter sooner.
+
+---
+
+# 8. Pitch Location
+
+These are extremely important for your zone analysis.
+
+## `plate_x`
+
+**Meaning:** Horizontal location of the pitch as it crosses home plate.
+
+Approximately measured in feet relative to the center of home plate.
+
+Conceptually:
+
+```text
+negative ← center → positive
+```
+
+Be careful when translating this into batter-relative inside/outside locations.
+
+---
+
+## `plate_z`
+
+**Meaning:** Vertical height of the pitch when it crosses home plate.
+
+Measured approximately in feet above the ground.
+
+Example:
+
+```text
+plate_z = 3.16
+```
+
+---
+
+## `sz_top`
+
+**Meaning:** Estimated top of the batter's strike zone.
+
+---
+
+## `sz_bot`
+
+**Meaning:** Estimated bottom of the batter's strike zone.
+
+Because different hitters have different heights and stances, the strike-zone boundaries can change slightly between observations.
+
+---
+
+## `zone`
+
+**Meaning:** Statcast categorical zone number.
+
+Observed values:
+
+```text
+1–9
+11–14
+```
+
+Conceptually, zones 1–9 describe regions around the traditional strike zone, while 11–14 represent regions outside it.
+
+For detailed spatial analysis, using:
+
+```text
+plate_x
+plate_z
+```
+
+is usually more flexible than relying only on `zone`.
+
+---
+
+# 9. Pitch Movement
+
+## `pfx_x`
+
+**Meaning:** Horizontal pitch movement.
+
+---
+
+## `pfx_z`
+
+**Meaning:** Vertical pitch movement relative to a gravity-only trajectory.
+
+---
+
+## `api_break_x_arm`
+
+**Meaning:** Horizontal break represented relative to the pitcher's arm side.
+
+---
+
+## `api_break_x_batter_in`
+
+**Meaning:** Horizontal movement represented relative to whether the ball moves toward the batter.
+
+These are more advanced pitching variables and probably do not need to be part of the first version of the hot-hand analysis.
+
+---
+
+# 10. Batted-Ball Type
+
+## `bb_type`
+
+**Meaning:** Type of batted ball.
+
+Observed categories:
+
+```text
+ground_ball
+line_drive
+fly_ball
+popup
+```
+
+This variable only has values when the ball is put into play.
+
+**Use:**
+
+Compare contact profile during Hot vs Cold periods.
+
+For example:
+
+$$
+P(LineDrive \mid Hot)
+$$
+
+versus:
+
+$$
+P(LineDrive \mid Cold)
+$$
+
+---
+
+# 11. Batted-Ball Location / Spray Chart
+
+## `hc_x`
+
+**Meaning:** Horizontal coordinate used to plot where the batted ball landed / was fielded on the Baseball Savant field image.
+
+---
+
+## `hc_y`
+
+**Meaning:** Vertical coordinate of the batted-ball location on the Baseball Savant field image.
+
+These are **plot coordinates**, not physical feet from home plate.
+
+Together:
+
+```r
+aes(x = hc_x, y = hc_y)
+```
+
+can be used to construct a spray chart.
+
+### Important
+
+`hc_x` and `hc_y` are only populated for balls put into play.
+
+Therefore many rows legitimately contain `NA`.
+
+This does **not** mean the data are broken.
+
+---
+
+# 12. Contact Quality Variables
+
+## `launch_speed`
+
+Also commonly called:
+
+**Exit Velocity**
+
+Meaning:
+
+Speed of the baseball immediately after contact.
+
+Usually measured in mph.
+
+Example:
+
+```text
+109.7
+```
+
+Higher exit velocity generally indicates harder contact.
+
+**Very useful for your project.**
+
+You could compare:
+
+$$
+ExitVelocity_{Hot}
+$$
+
+versus:
+
+$$
+ExitVelocity_{Cold}
+$$
+
+---
+
+## `launch_angle`
+
+**Meaning:** Vertical launch angle of the batted ball.
+
+Conceptually:
+
+* negative → ball driven toward ground
+* around 0 → low trajectory
+* moderate positive → line drive / fly ball
+* very high → popup
+
+Useful together with exit velocity.
+
+---
+
+## `hit_distance_sc`
+
+**Meaning:** Estimated batted-ball distance.
+
+Mostly relevant for balls hit into the field.
+
+---
+
+## `estimated_ba_using_speedangle`
+
+**Meaning:** Statcast estimated batting average based primarily on contact characteristics such as launch speed and launch angle.
+
+Often conceptually related to:
+
+$$
+xBA
+$$
+
+This is especially interesting for your project because it can distinguish:
+
+> actual hit outcome
+
+from:
+
+> expected quality of contact.
+
+For example, a batter can get a hit on weak contact or make an out on excellent contact.
+
+---
+
+## `estimated_woba_using_speedangle`
+
+**Meaning:** Expected wOBA based on batted-ball characteristics.
+
+This incorporates more information about offensive value than batting average alone.
+
+Potential future extension.
+
+---
+
+## `estimated_slg_using_speedangle`
+
+**Meaning:** Expected slugging value based on batted-ball characteristics.
+
+---
+
+# 13. Traditional Outcome-Value Variables
+
+## `woba_value`
+
+**Meaning:** wOBA value assigned to the plate-appearance outcome.
+
+Different outcomes receive different weights.
+
+For example, a home run receives much more value than a single.
+
+This differs from your binary hit variable because:
+
+$$
+Single = 1
+$$
+
+and
+
+$$
+HomeRun = 1
+$$
+
+under the simple hit/no-hit definition, while wOBA distinguishes their offensive value.
+
+---
+
+## `woba_denom`
+
+Indicates whether the plate appearance contributes to the wOBA denominator.
+
+Potentially useful for identifying qualifying plate appearances.
+
+---
+
+## `babip_value`
+
+Binary-type value associated with batting average on balls in play.
+
+Not necessary for the primary streak analysis.
+
+---
+
+## `iso_value`
+
+Represents isolated-power value associated with the event.
+
+It distinguishes extra-base hitting from singles.
+
+---
+
+# 14. Swing Variables
+
+Your dataset contains several modern Statcast bat-tracking variables.
+
+## `bat_speed`
+
+**Meaning:** Bat speed for eligible tracked swings.
+
+Many observations are missing because this metric is not available for every historical pitch.
+
+---
+
+## `swing_length`
+
+**Meaning:** Estimated length of the bat path during the swing.
+
+---
+
+## `attack_angle`
+
+**Meaning:** Angle at which the bat moves through the hitting zone.
+
+---
+
+## `attack_direction`
+
+**Meaning:** Direction of the bat path through contact.
+
+---
+
+## `swing_path_tilt`
+
+**Meaning:** Tilt/orientation of the swing path.
+
+These could be very valuable for later seasons but should probably be considered secondary because there are many missing observations.
+
+---
+
+# 15. Game Context Variables
+
+## `home_team`
+
+Home team abbreviation.
+
+Example:
+
+```text
+ATL
+```
+
+---
+
+## `away_team`
+
+Away team abbreviation.
+
+---
+
+## `inning`
+
+Current inning.
+
+---
+
+## `inning_topbot`
+
+Whether the pitch occurred in:
+
+```text
+Top
+Bot
+```
+
+---
+
+## `home_score`
+
+Home-team score before/currently at the pitch.
+
+---
+
+## `away_score`
+
+Away-team score.
+
+---
+
+## `bat_score`
+
+Score for Harris's batting team.
+
+---
+
+## `fld_score`
+
+Score for the fielding team.
+
+These variables allow future game-context analysis.
+
+---
+
+# 16. Base-Runner Variables
+
+## `on_1b`
+
+Runner ID on first base.
+
+## `on_2b`
+
+Runner ID on second base.
+
+## `on_3b`
+
+Runner ID on third base.
+
+`NA` means there was no runner on that base.
+
+These are not needed for the main streak analysis.
+
+---
+
+# 17. Fielding Variables
+
+## `fielder_2` – `fielder_9`
+
+MLB IDs for the fielders occupying each defensive position.
+
+For example:
+
+```text
+fielder_2 = catcher
+fielder_3 = first baseman
+...
+fielder_9 = right fielder
+```
+
+Probably unnecessary for the current hot-hand question.
+
+---
+
+## `if_fielding_alignment`
+
+Infield defensive alignment.
+
+Examples include:
+
+```text
+Standard
+Strategic
+```
+
+---
+
+## `of_fielding_alignment`
+
+Outfield defensive alignment.
+
+Potentially interesting for a more advanced spray-pattern analysis.
+
+---
+
+# 18. Variables Most Important for the Current Hot-Hand Project
+
+Rather than using all 118 variables, the primary analysis can focus on approximately these variables:
+
+| Variable                        | Purpose                             |
+| ------------------------------- | ----------------------------------- |
+| `game_date`                     | chronological ordering              |
+| `game_year`                     | season                              |
+| `game_pk`                       | unique game                         |
+| `at_bat_number`                 | identify plate appearance           |
+| `pitch_number`                  | identify final pitch                |
+| `events`                        | determine AB outcome                |
+| `description`                   | pitch outcome / swing behavior      |
+| `pitch_type`                    | pitcher pitch mix                   |
+| `pitch_name`                    | readable pitch type                 |
+| `release_speed`                 | pitcher velocity                    |
+| `p_throws`                      | pitcher handedness                  |
+| `plate_x`                       | horizontal pitch location           |
+| `plate_z`                       | vertical pitch location             |
+| `zone`                          | Statcast zone                       |
+| `bb_type`                       | ground ball / line drive / fly ball |
+| `hc_x`                          | spray-chart x-coordinate            |
+| `hc_y`                          | spray-chart y-coordinate            |
+| `launch_speed`                  | exit velocity                       |
+| `launch_angle`                  | launch angle                        |
+| `estimated_ba_using_speedangle` | expected contact success            |
+| `bat_speed`                     | bat speed where available           |
+| `swing_length`                  | swing-path metric where available   |
+
+---
+
+# 19. Variables for the Primary Streak Definition
+
+For the first part of the project, only a few variables are actually required.
+
+### Step 1 — Identify one completed plate appearance
+
+Use:
+
+```text
+game_pk
+at_bat_number
+events
+```
+
+### Step 2 — Determine whether it is an official at-bat
+
+Use:
+
+```text
+events
+```
+
+### Step 3 — Determine success
+
+Define:
+
+```text
+single      → 1
+double      → 1
+triple      → 1
+home_run    → 1
+```
+
+Eligible non-hit official AB outcomes become:
+
+```text
+0
+```
+
+while non-AB outcomes such as walks and HBP should be excluded from a batting-average denominator.
+
+### Step 4 — Order ABs
+
+Use:
+
+```text
+game_date
+game_pk
+at_bat_number
+```
+
+### Step 5 — Calculate rolling BA
+
+Create a sequence:
+
+$$
+X_1,X_2,\ldots,X_n
+$$
+
+where each (X_i) represents one official at-bat.
+
+Then calculate:
+
+$$
+RollingBA_t
+===========
+
+\frac{1}{w}
+\sum_{i=t-w+1}^{t}X_i
+$$
+
+---
+
+# 20. Conceptual Map of the Dataset
+
+The easiest way to remember the columns is:
+
+```text
+GAME
+│
+├── game_date
+├── game_year
+├── game_pk
+│
+↓
+PLATE APPEARANCE
+│
+├── at_bat_number
+├── events
+│
+↓
+PITCH
+│
+├── pitch_number
+├── pitch_type
+├── release_speed
+├── plate_x
+├── plate_z
+├── description
+│
+↓
+IF CONTACT OCCURS
+│
+├── bb_type
+├── launch_speed
+├── launch_angle
+├── hc_x
+├── hc_y
+│
+↓
+CONTACT QUALITY / EXPECTED OUTCOME
+│
+├── estimated_ba_using_speedangle
+├── estimated_woba_using_speedangle
+└── estimated_slg_using_speedangle
+```
+
+The key hierarchy is therefore:
+
+$$
+\boxed{
+Game
+\rightarrow
+Plate\ Appearance
+\rightarrow
+Pitch
+\rightarrow
+Contact
+\rightarrow
+Batted\ Ball
+}
+$$
+
+Your original CSV is stored primarily at the **pitch level**, while the primary streak analysis needs to operate at the **official-at-bat level**.

@@ -1,0 +1,3313 @@
+---
+title: "MLB report"
+author: "vicky zhang 12878"
+date: "2026-08-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Michael Harris II Hot-Hand Analysis
+
+## 1. Research Question & Motivation
+
+### Main Question
+
+Does Michael Harris II exhibit more short-term performance streakiness than would be expected from random variation alone?
+
+### Follow-up Question
+
+If some periods appear unusually hot or cold, what changes during those periods?
+
+Possible explanations:
+
+* Random variation
+* Changes in pitcher behavior
+* Changes in Harris's batting behavior
+
+---
+
+# 2. Data Preparation
+
+## 2.1 Load Packages and Data
+
+```{r message=FALSE, warning=FALSE}
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(readr)
+df <- read_csv("https://raw.githubusercontent.com/vickyzsw/mlb-hot-hand-analysis/refs/heads/main/data/savant_data.csv")
+head(df)
+```
+
+
+## 2.2 Clean and Organize Data
+
+### 2.2.1 Reorder data set 
+
+#### Baseball Game Logic
+
+A baseball game is normally divided into nine innings, and each inning consists of a top half and a bottom half. During each half-inning, one team bats while the other team pitches and plays defense. The batting team continues sending players to the plate until it records three outs.
+
+Each completed matchup between a batter and a pitcher is called a plate appearance. A plate appearance may contain one or multiple pitches and ends when a final outcome occurs, such as a hit, an out, a walk, a strikeout, or a hit-by-pitch. Within a plate appearance, `pitch_number` identifies the order of the pitches. In the Statcast data, `at_bat_number` identifies the order of plate appearances within a game, while `game_pk` uniquely identifies the game.
+
+*first change in codebook order*
+
+```{r}
+codebook_order <- c(
+  "game_date",
+  "game_year",
+  "game_pk",
+  "player_name",
+  "batter",
+  "pitcher",
+  "at_bat_number",
+  "pitch_number",
+  "balls",
+  "strikes",
+  "outs_when_up",
+  "events",
+  "description",
+  "type",
+  "des",
+  "stand",
+  "p_throws",
+  "pitch_type",
+  "pitch_name",
+  "release_speed",
+  "effective_speed",
+  "release_extension",
+  "plate_x",
+  "plate_z",
+  "sz_top",
+  "sz_bot",
+  "zone",
+  "pfx_x",
+  "pfx_z",
+  "api_break_x_arm",
+  "api_break_x_batter_in",
+  "bb_type",
+  "hc_x",
+  "hc_y",
+  "launch_speed",
+  "launch_angle",
+  "hit_distance_sc",
+  "estimated_ba_using_speedangle",
+  "estimated_woba_using_speedangle",
+  "estimated_slg_using_speedangle",
+  "woba_value",
+  "woba_denom",
+  "babip_value",
+  "iso_value",
+  "bat_speed",
+  "swing_length",
+  "attack_angle",
+  "attack_direction",
+  "swing_path_tilt",
+  "home_team",
+  "away_team",
+  "inning",
+  "inning_topbot",
+  "home_score",
+  "away_score",
+  "bat_score",
+  "fld_score",
+  "on_1b",
+  "on_2b",
+  "on_3b",
+  "fielder_2",
+  "fielder_3",
+  "fielder_4",
+  "fielder_5",
+  "fielder_6",
+  "fielder_7",
+  "fielder_8",
+  "fielder_9",
+  "if_fielding_alignment",
+  "of_fielding_alignment"
+)
+
+df <- df[, c(
+  intersect(codebook_order, names(df)),
+  setdiff(names(df), codebook_order)
+)]
+
+```
+
+*Data Reordering Logic*
+
+```{r}
+df <- df %>%
+  # Convert game_date from text into a real date variable
+  mutate(game_date = as.Date(game_date, format="%m/%d/%Y"))%>%
+  
+  # Arrange every pitch in chronological order
+  arrange(
+    game_date,
+    game_pk,
+    at_bat_number,
+    pitch_number
+  )
+
+# class(df$game_date)
+```
+
+
+The Statcast dataset contains one row for each pitch. To reconstruct the chronological sequence of pitches, the data are first ordered by `game_date` from earliest to latest. The `game_pk` variable is then used to keep pitches from the same game together. Within each game, `at_bat_number` orders the plate appearances, and `pitch_number` orders the individual pitches within each plate appearance.
+
+The reordering operation moves complete rows and does not separate or mismatch the variables within a row. Therefore, all information associated with a pitch—including its location, velocity, description, and outcome—remains together.
+
+### 2.2 Defination for the research variable
+
+#### Plate Appearance Identifier (`pa_id`)
+
+A plate appearance represents one complete matchup between a batter and a pitcher. Because each row of the Statcast dataset represents one pitch, multiple rows may belong to the same plate appearance. The variable `pa_id` combines `game_pk` and `at_bat_number` to uniquely identify each plate appearance.
+
+```{r}
+df <- df %>%
+  mutate(
+    pa_id = paste(game_pk, at_bat_number, sep = "_")
+  )
+```
+
+#### Final Pitch Indicator (`final_pitch`)
+
+The variable `final_pitch` indicates whether a pitch is the final pitch of a plate appearance. It equals `TRUE` for the final pitch and `FALSE` for all earlier pitches. The final pitch is important because the `events` variable, which records the outcome of a plate appearance, generally appears only on the final pitch.
+
+```{r}
+df <- df %>%
+  group_by(game_pk, at_bat_number) %>%
+  mutate(
+    final_pitch = pitch_number == max(pitch_number, na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+#### Plate-Appearance-Level Dataset (`pa_data`)
+
+The original dataset is recorded at the pitch level. To study batting outcomes, only the final pitch of each plate appearance is retained. The resulting dataset, `pa_data`, contains one row for each plate appearance and prevents the same batting outcome from being counted multiple times.
+
+```{r}
+pa_data <- df %>%
+  filter(final_pitch) %>%
+  arrange(
+    game_date,
+    game_pk,
+    at_bat_number
+  )
+
+# check if repeated
+pa_data %>%
+  count(game_pk, at_bat_number) %>%
+  filter(n > 1)
+```
+
+#### Official At-Bat Indicator (`official_at_bat`)
+
+The variable `official_at_bat` indicates whether a plate appearance counts as an official at-bat. It equals 1 for outcomes such as hits, strikeouts, field outs, and reaching base on an error. It equals 0 for outcomes that do not count as official at-bats, including walks, hit-by-pitches, sacrifice flies, and catcher interference.
+
+This distinction is necessary because batting average uses official at-bats, rather than all plate appearances, as its denominator.
+
+```{r}
+official_ab_events <- c(
+  "single",
+  "double",
+  "triple",
+  "home_run",
+  "field_out",
+  "force_out",
+  "strikeout",
+  "strikeout_double_play",
+  "grounded_into_double_play",
+  "double_play",
+  "triple_play",
+  "field_error",
+  "fielders_choice",
+  "fielders_choice_out"
+)
+
+pa_data <- pa_data %>%
+  mutate(
+    official_at_bat = if_else(
+      events %in% official_ab_events,
+      1L,
+      0L
+    )
+  )
+```
+
+
+#### Hit Indicator (`hit`)
+
+The variable `hit` is a binary measure of batting success. It equals 1 when the plate-appearance outcome is a single, double, triple, or home run, and 0 otherwise. This variable is used as the numerator when calculating batting average.
+
+Each official at-bat can therefore be represented as a binary outcome:
+
+- `hit = 1`: the batter records a hit;
+- `hit = 0`: the batter does not record a hit.
+
+```{r}
+hit_events <- c(
+  "single",
+  "double",
+  "triple",
+  "home_run"
+)
+
+pa_data <- pa_data %>%
+  mutate(
+    hit = if_else(
+      events %in% hit_events,
+      1L,
+      0L
+    )
+  )
+
+pa_data %>%
+  count(events, hit, sort = TRUE)
+```
+
+#### F. Rolling Batting Average (`rolling_ba_10`)
+
+The variable `rolling_ba_10` measures the proportion of hits recorded over the batter’s most recent 10 official at-bats. Because each official at-bat is represented as either a hit (`1`) or a non-hit (`0`), the mean of these binary outcomes is the batting average for that window.
+
+The rolling batting average is calculated separately for each season and is aligned with the final observation in each 10-at-bat window. The first nine official at-bats of each season have missing rolling averages because a complete 10-at-bat window is not yet available.
+
+This variable captures short-term changes in batting performance and is used to identify potential hot and cold periods.
+
+```{r}
+ab_data <- pa_data %>%
+  filter(official_at_bat == 1) %>%
+  arrange(
+    game_date,
+    game_pk,
+    at_bat_number
+  )
+
+
+ab_data <- ab_data %>%
+  group_by(game_year) %>%
+  mutate(
+    season_ab_number = row_number(),
+    cumulative_hits = cumsum(hit),
+    cumulative_batting_average =
+      cumulative_hits / season_ab_number
+  ) %>%
+  ungroup()
+
+
+ab_data <- ab_data %>%
+  group_by(game_year) %>%
+  mutate(
+    rolling_ba_10 = zoo::rollmean(
+      hit,
+      k = 10,
+      fill = NA,
+      align = "right"
+    )
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+ab_data %>%
+  select(
+    game_date,
+    game_year,
+    game_pk,
+    at_bat_number,
+    events,
+    official_at_bat,
+    hit,
+    season_ab_number,
+    cumulative_batting_average,
+    rolling_ba_10
+  ) %>%
+  print(n = 30)
+```
+
+---
+
+
+# 3. Measuring Short-Term Performance
+
+## 3.1 Rolling Batting Average
+
+### 3.1.1 Clarify the unit of analysis
+
+The original Statcast dataset contains one row per pitch. However, batting average is defined using official at-bats rather than individual pitches or all plate appearances. Therefore, the rolling batting average is constructed from the chronologically ordered official-at-bat-level dataset, `ab_data`.
+
+Each official at-bat is represented by the binary variable `hit`, where:
+
+- `hit = 1` for a single, double, triple, or home run;
+- `hit = 0` for a non-hit official at-bat.
+
+Walks, hit-by-pitches, sacrifice flies, and other outcomes that do not count as official at-bats are excluded before calculating batting average.
+
+```{r}
+ab_data %>%
+  select(
+    game_year,
+    game_date,
+    game_pk,
+    at_bat_number,
+    events,
+    hit
+  ) %>%
+  head(20)
+```
+
+
+### 3.1.2 Explore different window sizes
+
+```{r}
+ab_data <- ab_data %>%
+  arrange(
+    game_year,
+    game_date,
+    game_pk,
+    at_bat_number
+  ) %>%
+  group_by(game_year) %>%
+  mutate(
+    season_ab_number = row_number(),
+
+    rolling_ba_10 = zoo::rollmean(
+      hit,
+      k = 10,
+      fill = NA,
+      align = "right"
+    ),
+
+    rolling_ba_15 = zoo::rollmean(
+      hit,
+      k = 15,
+      fill = NA,
+      align = "right"
+    ),
+
+    rolling_ba_25 = zoo::rollmean(
+      hit,
+      k = 25,
+      fill = NA,
+      align = "right"
+    ),
+    rolling_ba_30 = zoo::rollmean(
+      hit,
+      k = 30,
+      fill = NA,
+      align = "right"
+    )
+  ) %>%
+  ungroup()
+```
+
+Several rolling-window sizes were initially considered. A 10-at-bat window responds quickly to recent outcomes, but it can be highly sensitive to individual hits and random variation. A 15-at-bat window provides moderate smoothing. A 25-at-bat window is more stable while remaining short enough to capture meaningful changes within a season.
+
+For each window size, the window moves forward by one official at-bat at a time. Therefore, the 25-at-bat windows are 1–25, 2–26, 3–27, and so forth. They are overlapping rolling windows rather than separate groups of 25 observations.
+
+### 3.1.3 Compare the three window sizes visually
+
+```{r}
+window_comparison <- ab_data %>%
+  select(
+    game_date,
+    game_year,
+    season_ab_number,
+    rolling_ba_10,
+    rolling_ba_15,
+    rolling_ba_25,
+    rolling_ba_30
+  ) %>%
+  pivot_longer(
+    cols = starts_with("rolling_ba_"),
+    names_to = "window",
+    values_to = "rolling_ba"
+  ) %>%
+  mutate(
+    window = recode(
+      window,
+      rolling_ba_10 = "10 ABs",
+      rolling_ba_15 = "15 ABs",
+      rolling_ba_25 = "25 ABs",
+      rolling_ba_30 = "30 ABs"
+    )
+  )
+```
+
+```{r}
+#| fig-width: 15
+#| fig-height: 7
+
+for (yr in sort(unique(window_comparison$game_year))) {
+
+  p <- window_comparison %>%
+    filter(game_year == yr) %>%
+    ggplot(
+      aes(
+        x = game_date,
+        y = rolling_ba,
+        color = window
+      )
+    ) +
+    geom_line(
+      linewidth = 1,
+      na.rm = TRUE
+    ) +
+    labs(
+      title = paste("Rolling Batting Average -", yr),
+      x = "Game Date",
+      y = "Rolling Batting Average",
+      color = "Window Size"
+    ) +
+    theme_minimal()
+
+  print(p)
+}
+```
+
+Rolling-window comparison. To determine an appropriate window size for measuring short-term batting performance, I compared rolling batting averages calculated over 10, 15, 25, and 30 official at-bats. As expected, the 10-AB window is highly responsive to recent outcomes but also produces substantial short-term volatility, with sharp increases and decreases caused by only a few hits or outs. Increasing the window size progressively smooths these fluctuations. The 25- and 30-AB windows produce more stable estimates and reveal broader periods of elevated or depressed performance, although they respond more slowly to sudden changes. The 15-AB window lies between these extremes, retaining more short-term variation than the larger windows while reducing some of the noise present in the 10-AB measure.
+
+Across window sizes, several broader performance patterns remain visible, including stronger batting performance around mid-to-late June and early September and weaker stretches during parts of July and late September. The persistence of these patterns across multiple window sizes suggests that they are not solely artifacts of one particular rolling-window choice. However, the figure itself does not establish a hot-hand effect; it is used to examine the sensitivity of the rolling-performance measure to the choice of window size. Whether the observed variation exceeds what would be expected from random batting outcomes is evaluated separately using Monte Carlo simulation.
+
+
+
+
+A consistent rolling window of **25 official at-bats** is used throughout the analysis.
+
+For official at-bat t:
+
+$$
+RollingBA_t =
+\frac{\text{number of hits from official at-bats }t-24\text{ through }t}{25}
+$$
+
+The window moves forward by one official at-bat at a time. Therefore, the first window contains official at-bats 1–25, the second contains official at-bats 2–26, and so forth.
+
+The purpose of rolling batting average is to describe short-term fluctuations in Michael Harris II's batting performance. However, a high rolling batting average or a visible streak does not, by itself, demonstrate a hot-hand effect because random sequences can naturally contain streaks.
+
+
+
+
+
+## 3.2 Visualize Rolling Performance by Season
+
+Plot rolling BA separately for:
+
+* 2022
+* 2023
+* 2024
+* 2025
+
+This is the descriptive stage.
+
+Question:
+
+> Where do apparent hot and cold periods occur?
+
+Do **not** yet conclude that they represent a real hot-hand effect.
+
+*Season-Level Batting Average*
+
+```{r}
+## calculate the overall batting average for each season
+season_summary <- ab_data %>%
+  group_by(game_year) %>%
+  summarise(
+    official_at_bats = n(),
+    total_hits = sum(hit),
+    season_ba = mean(hit),
+    .groups = "drop"
+  )
+
+season_summary
+```
+
+
+The overall batting average was calculated separately for each season. This provides a season-level baseline against which short-term rolling performance can be compared. A rolling batting average above the season average indicates relatively strong recent performance, while a value below the season average indicates relatively weak recent performance.
+
+```{r}
+for (yr in sort(unique(ab_data$game_year))) {
+  
+  # Select data for one season
+  season_data <- ab_data %>%
+    filter(game_year == yr)
+  
+  # Select the overall batting average for that season
+  season_average <- season_summary %>%
+    filter(game_year == yr)
+  
+  # Create the plot
+  p <- ggplot(
+    season_data,
+    aes(
+      x = season_ab_number,
+      y = rolling_ba_25
+    )
+  ) +
+    geom_line(
+      color = "#2166AC",
+      linewidth = 0.8,
+      na.rm = TRUE
+    ) +
+    geom_hline(
+      data = season_average,
+      aes(yintercept = season_ba),
+      color = "#B2182B",
+      linetype = "dashed",
+      linewidth = 0.7
+    ) +
+    labs(
+      title = paste(
+        "Michael Harris II:",
+        yr,
+        "Season"
+      ),
+      subtitle = paste(
+        "25-at-bat rolling average and",
+        yr,
+        "season batting average"
+      ),
+      x = "Official At-Bat Number Within Season",
+      y = "25-At-Bat Rolling Batting Average"
+    ) +
+    theme_minimal(base_size = 12)
+  
+  print(p)
+}
+```
+
+
+
+
+---
+
+# 4. Is the Observed Streakiness More Than Randomness?
+
+The rolling batting-average plots show periods of relatively high and low performance. However, apparent streaks can occur naturally even when a batter's underlying probability of recording a hit remains constant.
+
+The purpose of the null model is therefore to determine how much rolling-performance variation would normally occur if Michael Harris II had no hot-hand effect.
+
+## 4.1 Null Hypothesis
+
+### 4.1.1 Define the null hypothesis
+
+For each season y, let $H_{y,t}$ denote the outcome of official at-bat t, where
+
+$$
+H_{y,t} =
+\begin{cases}
+1, & \text{if the at-bat results in a hit},\\
+0, & \text{otherwise}.
+\end{cases}
+$$
+
+The null hypothesis assumes that, within a season, official at-bat outcomes are independent Bernoulli random variables with a constant probability of success:
+
+$$
+H_{y,t} \overset{i.i.d.}{\sim}
+\text{Bernoulli}(p_y).
+$$
+
+The season-specific hit probability $p_y$ is estimated using the player's observed batting average in season $y$:
+
+$$
+\hat p_y =
+\frac{\text{total hits in season }y}
+{\text{total official at-bats in season }y}.
+$$
+
+Therefore, the null hypothesis is:
+
+$$
+H_0:
+P(H_{y,t}=1)=p_y
+\text{ is constant across official at-bats within season }y,
+$$
+
+and the outcomes of consecutive official at-bats are independent.
+
+
+Under the null hypothesis, the batter is not expected to produce the same outcome in every at-bat. Random sequences may still contain consecutive hits, consecutive non-hits, high rolling averages, and low rolling averages.
+
+The null hypothesis states only that these patterns arise from independent random variation around a constant season-level hit probability, rather than from a persistent hot or cold performance state.
+
+### 4.1.2 identify the season-specific parameters
+
+```{r}
+season_summary
+```
+
+The null model is constructed separately for each season. The previously calculated `season_summary` table provides the required parameters:
+
+- `official_at_bats` determines the length of the simulated season;
+- `season_ba` provides the estimated hit probability;
+- `total_hits` describes the observed number of hits for comparison.
+
+Using separate season-level probabilities allows average performance to differ across seasons. However, within each simulated season, the hit probability remains constant across all official at-bats.
+
+
+
+
+## 4.2 Measure Streakiness
+
+To evaluate whether a season exhibits more performance fluctuation than expected under randomness, a season-level streakiness statistic is required.
+
+The primary streakiness statistic is the variance of the 25-at-bat rolling batting average:
+
+$$
+T_y =
+\operatorname{Var}
+\left(
+RollingBA_{y,25}
+\right).
+$$
+
+A larger variance indicates that the rolling batting average moves farther away from its typical level and therefore exhibits greater within-season fluctuation.
+
+The minimum, maximum, and range of the rolling batting average are also calculated as supplementary descriptive measures:
+
+$$
+Range_y =
+\max(RollingBA_{y,25})
+-
+\min(RollingBA_{y,25}).
+$$
+
+The rolling-average variance is treated as the primary inferential statistic because it summarizes variability across the entire season, rather than focusing only on one extreme window.
+
+```{r}
+# define for the observed description
+observed_streakiness <- ab_data %>%
+  filter(!is.na(rolling_ba_25)) %>%
+  group_by(game_year) %>%
+  summarise(
+    number_of_windows = n(),
+    
+    observed_mean_rolling_ba =
+      mean(rolling_ba_25),
+    
+    observed_variance =
+      var(rolling_ba_25),
+    
+    observed_sd =
+      sd(rolling_ba_25),
+    
+    observed_min =
+      min(rolling_ba_25),
+    
+    observed_max =
+      max(rolling_ba_25),
+    
+    observed_range =
+      observed_max - observed_min,
+    
+    .groups = "drop"
+  )
+
+observed_streakiness
+```
+
+## 4.3 Monte Carlo Simulation
+
+For each season:
+
+1. Calculate Harris's season average hit probability (p).
+2. Simulate an independent Bernoulli season with the same number of observations.
+3. Calculate 25-PA rolling BA.
+4. Calculate its variance.
+5. Repeat 5,000 times.
+
+This produces the null distribution:
+
+$$
+T_1,T_2,\ldots,T_{5000}
+$$
+
+
+
+```{r}
+# Monte Carlo simulation under the null hypothesis
+n_simulations <- 5000
+window_size <- 25
+
+set.seed(123)
+
+simulation_results_list <- vector(
+  mode = "list",
+  length = nrow(season_summary)
+)
+
+for (i in seq_len(nrow(season_summary))) {
+  
+  # Extract the null parameters for the current season
+  current_year <- season_summary$game_year[i]
+  current_n <- season_summary$official_at_bats[i]
+  current_p <- season_summary$season_ba[i]
+  
+  # Create storage for this season's 5,000 simulations
+  one_year_results <- tibble(
+    game_year = current_year,
+    simulation = seq_len(n_simulations),
+    simulated_variance = NA_real_,
+    simulated_sd = NA_real_,
+    simulated_min = NA_real_,
+    simulated_max = NA_real_,
+    simulated_range = NA_real_
+  )
+  
+  for (b in seq_len(n_simulations)) {
+    
+    # Simulate one complete season under the null hypothesis
+    simulated_hits <- rbinom(
+      n = current_n,
+      size = 1,
+      prob = current_p
+    )
+    
+    # Apply the same 25-at-bat rolling window
+    simulated_rolling_ba <- zoo::rollmean(
+      simulated_hits,
+      k = window_size,
+      align = "right"
+    )
+    
+    # Store the simulated streakiness statistics
+    one_year_results$simulated_variance[b] <-
+      var(simulated_rolling_ba)
+    
+    one_year_results$simulated_sd[b] <-
+      sd(simulated_rolling_ba)
+    
+    one_year_results$simulated_min[b] <-
+      min(simulated_rolling_ba)
+    
+    one_year_results$simulated_max[b] <-
+      max(simulated_rolling_ba)
+    
+    one_year_results$simulated_range[b] <-
+      max(simulated_rolling_ba) -
+      min(simulated_rolling_ba)
+  }
+  
+  simulation_results_list[[i]] <- one_year_results
+}
+```
+
+*This Monte Carlo procedure generates 5,000 null seasons separately for each observed season. For each year, the code first extracts the observed number of official at-bats and the season batting average from `season_summary`. These values determine the length of the simulated season and the constant probability of recording a hit under the null hypothesis.*
+
+*Within each simulation, every official at-bat is generated independently from a Bernoulli distribution, where `1` represents a hit and `0` represents a non-hit. The same 25-at-bat rolling window used for the observed data is then applied to the simulated hit sequence.*
+
+*For each simulated season, the code records the variance, standard deviation, minimum, maximum, and range of the rolling batting average. These statistics measure different aspects of simulated performance fluctuation and form the null distributions used for comparison with the observed seasons.*
+
+*The procedure preserves the observed season length and season-level batting average while removing any temporal dependence or persistent hot/cold performance state. A fixed random seed is used to make the simulation results reproducible.*
+
+*The outer loop--i, processes each season separately, while the inner loop--b, generates 5,000 null realizations for that season. After all simulations for one season are completed, the resulting statistics are stored in `simulation_results_list`.*
+
+
+```{r}
+simulation_results <- bind_rows(
+  simulation_results_list
+)
+
+simulation_results
+```
+
+
+## 4.4 Monte Carlo p-value
+
+The primary Monte Carlo p-value is the proportion of simulated seasons whose rolling-average variance is at least as large as the observed variance.
+
+A small p-value indicates that the observed season-level variation is unusually large relative to the constant-probability null model.
+
+The p-value is calculated as:
+
+$$
+p_y =
+\frac{
+1+
+\sum_{b=1}^{B}
+I(T_{y,b}^{sim}\geq T_y^{obs})
+}{
+B+1
+},
+$$
+
+where $B=5{,}000$, $T_y^{obs}$ is the observed rolling-average variance, and $T_{y,b}^{sim}$ is the variance from null simulation b.
+
+The addition of one to both the numerator and denominator prevents an estimated p-value of exactly zero and produces a valid finite-simulation estimate.
+
+The results are interpreted using the following descriptive categories:
+
+- $p < 0.05$: statistically unusual streakiness;
+- $0.05 \leq p < 0.10$: suggestive evidence of unusual streakiness;
+- $p \geq 0.10$: variation consistent with the null model.
+
+A large p-value does not prove that the hot-hand effect is absent. It indicates that the observed variation is not unusually large relative to the specified null model.
+
+```{r}
+# join observed and simulated statistics
+simulation_comparison <- simulation_results %>%
+  left_join(
+    observed_streakiness,
+    by = "game_year"
+  )
+```
+
+```{r}
+# calculatge monte carlo p_values
+monte_carlo_pvalues <- simulation_comparison %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_variance =
+      first(observed_variance),
+    
+    mean_simulated_variance =
+      mean(simulated_variance),
+    
+    variance_95th_percentile =
+      quantile(simulated_variance, 0.95),
+    
+    variance_p_value =
+      (
+        1 +
+        sum(
+          simulated_variance >=
+            first(observed_variance)
+        )
+      ) /
+      (n() + 1),
+    
+    observed_max =
+      first(observed_max),
+    
+    maximum_p_value =
+      (
+        1 +
+        sum(
+          simulated_max >=
+            first(observed_max)
+        )
+      ) /
+      (n() + 1),
+    
+    observed_min =
+      first(observed_min),
+    
+    minimum_p_value =
+      (
+        1 +
+        sum(
+          simulated_min <=
+            first(observed_min)
+        )
+      ) /
+      (n() + 1),
+    
+    observed_range =
+      first(observed_range),
+    
+    range_p_value =
+      (
+        1 +
+        sum(
+          simulated_range >=
+            first(observed_range)
+        )
+      ) /
+      (n() + 1),
+    
+    .groups = "drop"
+  )
+
+monte_carlo_pvalues
+```
+
+
+## 4.5 Year-by-Year Results
+
+```{r}
+# construct the final results table
+
+yearly_results <- monte_carlo_pvalues %>%
+  left_join(
+    season_summary,
+    by = "game_year"
+  ) %>%
+  mutate(
+    evidence_category = case_when(
+      variance_p_value < 0.05 ~
+        "Statistically unusual",
+      
+      variance_p_value < 0.10 ~
+        "Suggestive evidence",
+      
+      TRUE ~
+        "Consistent with null"
+    )
+  ) %>%
+  select(
+    game_year,
+    official_at_bats,
+    total_hits,
+    season_ba,
+    observed_variance,
+    mean_simulated_variance,
+    variance_95th_percentile,
+    variance_p_value,
+    observed_min,
+    minimum_p_value,
+    observed_max,
+    maximum_p_value,
+    observed_range,
+    range_p_value,
+    evidence_category
+  )
+
+print(yearly_results, n = Inf, width = Inf)
+
+```
+
+
+### 4.5.1 Definition of Result Variables**
+
+The year-by-year results table contains the following variables:
+
+- **`game_year`**: The MLB season being analyzed.
+
+- **`official_at_bats`**: The total number of official at-bats observed during the season. Walks, hit-by-pitches, sacrifice flies, and other plate appearances excluded from the batting-average denominator are not counted.
+
+- **`total_hits`**: The total number of singles, doubles, triples, and home runs recorded during the season.
+
+- **`season_ba`**: The observed batting average for the season, calculated as total hits divided by official at-bats.
+
+- **`observed_variance`**: The variance of the observed 25-at-bat rolling batting average. This is the primary season-level streakiness statistic. A larger value indicates greater fluctuation in recent batting performance.
+
+- **`mean_simulated_variance`**: The average rolling-BA variance across the 5,000 seasons generated under the constant-probability null model.
+
+- **`variance_95th_percentile`**: The 95th percentile of the 5,000 simulated variances. Only approximately 5% of null seasons produce a variance above this threshold.
+
+- **`variance_p_value`**: The Monte Carlo proportion of simulated seasons with variance at least as large as the observed variance. This is the primary p-value used to evaluate season-level streakiness.
+
+- **`observed_min`**: The lowest observed 25-at-bat rolling batting average during the season.
+
+- **`minimum_p_value`**: The proportion of null seasons whose minimum rolling batting average was equal to or lower than the observed minimum. A small value indicates an unusually cold window.
+
+- **`observed_max`**: The highest observed 25-at-bat rolling batting average during the season.
+
+- **`maximum_p_value`**: The proportion of null seasons whose maximum rolling batting average was equal to or higher than the observed maximum. A small value indicates an unusually hot window.
+
+- **`observed_range`**: The difference between the maximum and minimum observed rolling batting averages.
+
+- **`range_p_value`**: The proportion of null seasons whose rolling-BA range was equal to or larger than the observed range.
+
+- **`evidence_category`**: A descriptive classification based on the primary variance p-value. Values below 0.05 are classified as statistically unusual, values between 0.05 and 0.10 as suggestive evidence, and values of at least 0.10 as consistent with the null model.
+
+### 4.5.2 Interpretation
+
+**2022 Season**
+
+In 2022, Michael Harris II recorded 123 hits in 414 official at-bats, producing a season batting average of 0.297. The observed rolling-average variance was 0.00679, which was lower than the mean simulated variance of 0.00780.
+
+The variance Monte Carlo p-value was 0.634, indicating that approximately 63% of the simulated null seasons produced rolling-average variance at least as large as the observed value. Therefore, the overall level of fluctuation in 2022 was consistent with the constant-probability null model.
+
+The observed rolling batting average ranged from 0.08 to 0.52. However, the minimum, maximum, and range p-values were 0.511, 0.638, and 0.489, respectively. None of these extreme-window statistics was unusual under the null model.
+
+**2023 Season**
+
+In 2023, Michael Harris II recorded 148 hits in 505 official at-bats, resulting in a season batting average of 0.293. The observed rolling-average variance was 0.00998, which was higher than the mean null variance of 0.00784 but remained below the null distribution's 95th-percentile threshold of 0.01142.
+
+The variance p-value was 0.138. Although the observed season showed somewhat greater variation than the average simulated season, the result did not provide statistically significant or suggestive evidence of unusual streakiness under the prespecified thresholds.
+
+The observed rolling batting average ranged from 0.04 to 0.52. The minimum, maximum, and range p-values were 0.180, 0.681, and 0.282, respectively. These results indicate that neither the coldest window, the hottest window, nor the total rolling range was unusual relative to the null simulations.
+
+**2024 Season**
+
+
+In 2024, Michael Harris II recorded 116 hits in 440 official at-bats, producing a season batting average of 0.264. The observed rolling-average variance was 0.01021, compared with a mean simulated variance of 0.00732.
+
+The variance p-value was 0.089. This does not meet the conventional 0.05 significance threshold, but it provides suggestive evidence that the overall rolling-performance variation may have been greater than expected under the constant-probability null model.
+
+The 2024 season contained particularly extreme windows. The minimum rolling batting average was 0.00, with a p-value of 0.052, indicating a borderline-unusual cold period. The maximum was 0.60, with a p-value of 0.041, indicating that the hottest 25-at-bat window was unusual relative to the null simulations. The observed range was 0.60, with a p-value of 0.004, providing strong evidence that the distance between the season's coldest and hottest windows was unusually large.
+
+**2025 Season**
+
+In 2025, Michael Harris II recorded 152 hits in 611 official at-bats, producing a season batting average of 0.249. The observed rolling-average variance was 0.01455, more than twice the mean simulated variance of 0.00715. It also exceeded the simulated 95th-percentile threshold of 0.01018.
+
+The variance Monte Carlo p-value was approximately 0.0002. None of the 5,000 simulated seasons produced a variance as large as the observed value; the reported nonzero value results from the finite-simulation correction. This provides strong evidence that the overall rolling-performance variation in 2025 was unusually large under the constant-probability null model.
+
+However, the observed minimum of 0.04, maximum of 0.52, and range of 0.48 were not individually unusual, with p-values of 0.567, 0.318, and 0.219, respectively. This indicates that the 2025 result was not driven by one uniquely extreme high or low window. Instead, it appears to reflect repeated or sustained movement between relatively strong and weak performance periods across the season.
+
+#### Overall Comparison
+
+The results show a progression in observed season-level variability. The 2022 and 2023 seasons were consistent with the constant-probability null model. The 2024 season provided suggestive evidence of unusual overall variability and contained an unusually large distance between its hottest and coldest rolling windows. The 2025 season showed strong evidence of unusual season-level variation, with an observed rolling-average variance substantially larger than the simulated null expectation.
+
+Importantly, the 2024 and 2025 results represent different patterns. The 2024 finding was characterized by particularly extreme individual hot and cold windows, whereas the 2025 finding was characterized by repeated and sustained fluctuations throughout the season rather than by a uniquely extreme maximum or minimum.
+
+## 4.6 Null-Envelope Visualization
+
+Plot:
+
+* observed rolling BA;
+* average simulated rolling BA;
+* 95% simulation envelope.
+
+Purpose:
+
+Show visually when observed short-term performance approaches or moves outside what the null model typically produces.
+
+```{r}
+#generate the nul envelope
+set.seed(456)
+
+null_envelope_list <- vector(
+  mode = "list",
+  length = nrow(season_summary)
+)
+
+for (i in seq_len(nrow(season_summary))) {
+  
+  current_year <- season_summary$game_year[i]
+  current_n <- season_summary$official_at_bats[i]
+  current_p <- season_summary$season_ba[i]
+  
+  # Generate an n × 5000 matrix of hit outcomes
+  simulated_hit_matrix <- matrix(
+    rbinom(
+      n = current_n * n_simulations,
+      size = 1,
+      prob = current_p
+    ),
+    nrow = current_n,
+    ncol = n_simulations
+  )
+  
+  # Calculate rolling BA for every simulated season
+  simulated_rolling_matrix <- apply(
+    simulated_hit_matrix,
+    MARGIN = 2,
+    FUN = function(x) {
+      zoo::rollmean(
+        x,
+        k = window_size,
+        align = "right"
+      )
+    }
+  )
+  
+  null_envelope_list[[i]] <- tibble::tibble(
+    game_year = current_year,
+    
+    season_ab_number =
+      window_size:current_n,
+    
+    null_lower = apply(
+      simulated_rolling_matrix,
+      MARGIN = 1,
+      FUN = quantile,
+      probs = 0.025
+    ),
+    
+    null_median = apply(
+      simulated_rolling_matrix,
+      MARGIN = 1,
+      FUN = median
+    ),
+    
+    null_upper = apply(
+      simulated_rolling_matrix,
+      MARGIN = 1,
+      FUN = quantile,
+      probs = 0.975
+    )
+  )
+}
+```
+
+```{r}
+# combine the year
+null_envelope <- bind_rows(
+  null_envelope_list
+)
+
+null_envelope
+```
+
+
+```{r}
+# add the observed rolling BA
+envelope_comparison <- ab_data %>%
+  select(
+    game_year,
+    season_ab_number,
+    observed_rolling_ba = rolling_ba_25
+  ) %>%
+  filter(!is.na(observed_rolling_ba)) %>%
+  left_join(
+    null_envelope,
+    by = c(
+      "game_year",
+      "season_ab_number"
+    )
+  )
+```
+
+```{r}
+# Plot for every season
+for (yr in sort(unique(envelope_comparison$game_year))) {
+  
+  year_envelope <- envelope_comparison %>%
+    filter(game_year == yr)
+  
+  year_summary <- season_summary %>%
+    filter(game_year == yr)
+  
+  p <- ggplot(
+    year_envelope,
+    aes(x = season_ab_number)
+  ) +
+    geom_ribbon(
+      aes(
+        ymin = null_lower,
+        ymax = null_upper
+      ),
+      fill = "#BDBDBD",
+      alpha = 0.45
+    ) +
+    geom_line(
+      aes(y = null_median),
+      color = "#636363",
+      linetype = "dotted",
+      linewidth = 0.7
+    ) +
+    geom_line(
+      aes(y = observed_rolling_ba),
+      color = "#2166AC",
+      linewidth = 0.9
+    ) +
+    geom_hline(
+      data = year_summary,
+      aes(yintercept = season_ba),
+      color = "#B2182B",
+      linetype = "dashed",
+      linewidth = 0.7
+    ) +
+    labs(
+      title = paste(
+        "Observed Rolling BA and Null Envelope:",
+        yr
+      ),
+      subtitle = "Blue: observed; gray: pointwise 95% null envelope; red: season BA",
+      x = "Official At-Bat Number Within Season",
+      y = "25-At-Bat Rolling Batting Average"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold")
+    )
+  
+  print(p)
+}
+```
+
+The blue line represents the observed 25-at-bat rolling batting average. The dashed red line represents the observed batting average for the full season.
+
+The gray region represents the pointwise 95% null envelope. At each official-at-bat position, its lower and upper boundaries are the 2.5th and 97.5th percentiles of the rolling batting averages produced by the simulated null seasons.
+
+The dotted gray line represents the median rolling batting average across the null simulations at each position.
+
+**2022 Null Envelope**
+
+The 2022 observed rolling series moved above and below the season average and crossed the pointwise null envelope on a small number of occasions. However, the season-level variance p-value was 0.634, and the minimum, maximum, and range statistics were also consistent with the null model.
+
+Therefore, the isolated envelope crossings should not be interpreted as evidence of a hot-hand effect. When hundreds of overlapping windows are examined, occasional pointwise crossings can occur even under the null hypothesis.
+
+**2023 Null Envelope**
+
+The 2023 rolling series displayed an early cold period followed by a strong increase in performance. Several portions of the observed curve approached or crossed the pointwise envelope.
+
+Nevertheless, the variance p-value of 0.138 indicates that the overall amount of fluctuation was not unusual relative to the null simulations. The extreme-window tests also failed to identify an unusually low minimum, high maximum, or large range.
+
+**2024 Null Envelope**
+
+The 2024 rolling series contained a pronounced cold period near the first third of the season, during which the 25-at-bat rolling batting average reached zero. A strong hot period later in the season reached 0.60. Both periods extended beyond the pointwise null envelope.
+
+The season-level variance result was suggestive rather than conventionally statistically significant, with a p-value of 0.089. However, the maximum and range tests indicated that the hottest window and the distance between the hottest and coldest windows were unusual under the null model.
+
+The envelope therefore helps identify the early cold period and late hot period as candidate intervals for further investigation.
+
+**2025 Null Envelope**
+
+The 2025 observed rolling series repeatedly moved outside the pointwise null envelope and displayed several extended high and low periods. Unlike 2024, the observed maximum, minimum, and range were not individually unusual relative to the null simulations.
+
+Instead, the strong variance result reflects the frequency and persistence of the fluctuations across the full season. The observed variance was substantially larger than the null expectation, with a Monte Carlo p-value of approximately 0.0002.
+
+This pattern suggests that 2025 cannot be characterized by only one extreme hot or cold window. The unusual feature is the repeated movement between strong and weak performance periods over the course of the season.
+
+
+#### conclusion
+
+The null envelope is pointwise rather than simultaneous. Consequently, it does not provide a separate 5% test for the entire observed curve. Because many highly overlapping windows are examined, occasional envelope crossings are expected even under the null model.
+
+The envelope is therefore used to locate candidate hot and cold periods, while the Monte Carlo variance p-value remains the primary season-level inferential result.
+
+---
+
+# 5. Define Hot, Neutral, and Cold Periods
+
+
+After evaluating season-level streakiness using the Monte Carlo framework, the observed rolling batting averages were standardized within each season to identify candidate performance states for exploratory mechanism analysis.
+
+For official at-bat position $t$, the standardized rolling batting average was calculated as:
+
+$$
+z_t=
+\frac{RollingBA_t-\overline{RollingBA}}
+{SD(RollingBA)}.
+$$
+
+A window was classified as Hot when its rolling batting average was at least one standard deviation above the season-specific mean, Cold when it was at least one standard deviation below the mean, and Neutral otherwise.
+
+The standardization was conducted separately for every season so that the classifications reflect relative performance within a season rather than differences in overall batting average across seasons. The first 24 official at-bats of each season were not classified because a complete 25-at-bat rolling window was unavailable.
+
+```{r}
+ab_data <- ab_data %>%
+  group_by(game_year) %>%
+  mutate(
+    mean_rolling_ba = mean(
+      rolling_ba_25,
+      na.rm = TRUE
+    ),
+    
+    sd_rolling_ba = sd(
+      rolling_ba_25,
+      na.rm = TRUE
+    ),
+    
+    rolling_ba_z = (
+      rolling_ba_25 - mean_rolling_ba
+    ) / sd_rolling_ba,
+    
+    # define the performance status
+    performance_state = case_when(
+      is.na(rolling_ba_z) ~ NA_character_,
+      rolling_ba_z >= 1 ~ "Hot",
+      rolling_ba_z <= -1 ~ "Cold",
+      TRUE ~ "Neutral"
+    )
+  ) %>%
+  ungroup()
+```
+
+
+
+
+
+```{r}
+state_summary <- ab_data %>%
+  filter(!is.na(performance_state)) %>%
+  count(
+    game_year,
+    performance_state,
+    name = "number_of_windows"
+  ) %>%
+  group_by(game_year) %>%
+  mutate(
+    proportion_of_windows =
+      number_of_windows /
+      sum(number_of_windows)
+  ) %>%
+  ungroup()
+
+print(state_summary, n =Inf, width = Inf)
+```
+
+---
+
+# 6. Mechanism Analysis I — Did Pitchers Change Their Approach?
+
+Now ask:
+
+> When Harris became hot, did pitchers respond differently?
+## 6.0 Prior Performance State
+
+To investigate whether pitchers changed their approach in response to Harris's recent performance, each official at-bat was classified using only information available before that at-bat began.
+
+The performance state for official at-bat $t$ was based on the rolling batting average from the previous 25 official at-bats, ending at $(t-1)$. This lagged definition prevents the outcome of the current at-bat from affecting the state used to analyze the pitches thrown during that same at-bat.
+
+The resulting variable, `prior_performance_state`, therefore represents whether Harris entered an at-bat in a Hot, Neutral, or Cold state based on his recent observed performance.
+
+```{r}
+pa_with_prior_count <- pa_data %>%
+  arrange(
+    game_year,
+    game_date,
+    game_pk,
+    at_bat_number
+  ) %>%
+  group_by(game_year) %>%
+  mutate(
+    prior_official_ab_count = lag(
+      cumsum(official_at_bat),
+      default = 0
+    )
+  ) %>%
+  ungroup()
+
+
+
+performance_history <- ab_data %>%
+  select(
+    game_year,
+    season_ab_number,
+    rolling_ba_25,
+    rolling_ba_z,
+    performance_state
+  ) %>%
+  rename(
+    prior_official_ab_count =
+      season_ab_number,
+    
+    prior_rolling_ba_25 =
+      rolling_ba_25,
+    
+    prior_rolling_z =
+      rolling_ba_z,
+    
+    prior_performance_state =
+      performance_state
+  )
+
+pa_with_state <- pa_with_prior_count %>%
+  left_join(
+    performance_history,
+    by = c(
+      "game_year",
+      "prior_official_ab_count"
+    )
+  )
+
+
+
+state_lookup <- pa_with_state %>%
+  select(
+    game_year,
+    game_pk,
+    at_bat_number,
+    prior_official_ab_count,
+    prior_rolling_ba_25,
+    prior_rolling_z,
+    prior_performance_state
+  )
+
+
+pitch_data_with_state <- df %>%
+  left_join(
+    state_lookup,
+    by = c(
+      "game_year",
+      "game_pk",
+      "at_bat_number"
+    )
+  )
+
+
+pitch_data_with_state %>%
+  filter(!is.na(prior_performance_state)) %>%
+  group_by(
+    game_pk,
+    at_bat_number
+  ) %>%
+  summarise(
+    number_of_states =
+      n_distinct(prior_performance_state),
+    .groups = "drop"
+  ) %>%
+  filter(number_of_states > 1)
+
+```
+
+
+## 6.1 Fastball Velocity
+
+Compare pitcher fastball velocity across Harris's performance states.
+
+Question:
+
+> Were pitchers throwing harder when Harris was hot?
+
+*analysis four-seam fastball*
+
+```{r}
+
+fastball_data <- pitch_data_with_state %>%
+  filter(
+    pitch_type == "FF",
+    !is.na(release_speed),
+    !is.na(prior_performance_state)
+  )
+```
+
+```{r}
+fastball_velocity_summary <- fastball_data %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  summarise(
+    number_of_fastballs = n(),
+    mean_velocity = mean(release_speed),
+    sd_velocity = sd(release_speed),
+    median_velocity = median(release_speed),
+    maximum_velocity = max(release_speed),
+    .groups = "drop"
+  )
+
+fastball_velocity_summary
+```
+
+```{r}
+ggplot(
+  fastball_data,
+  aes(
+    x = prior_performance_state,
+    y = release_speed,
+    fill = prior_performance_state
+  )
+) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.alpha = 0.2
+  ) +
+  facet_wrap(
+    ~ game_year,
+    scales = "free_y"
+  ) +
+  scale_x_discrete(
+    limits = c("Cold", "Neutral", "Hot")
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Cold" = "#2166AC",
+      "Neutral" = "#BDBDBD",
+      "Hot" = "#B2182B"
+    )
+  ) +
+  labs(
+    title = "Four-Seam Fastball Velocity by Prior Performance State",
+    subtitle = "Performance state is based on the previous 25 official at-bats",
+    x = "Prior Performance State",
+    y = "Release Speed (mph)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+
+Four-seam fastball release speed was compared across Harris's prior Cold, Neutral, and Hot performance states. The performance state for each at-bat was defined using the previous 25 official at-bats, ensuring that the current at-bat outcome was not used to classify the state faced by the pitcher.
+
+The boxplots show substantial overlap in four-seam fastball velocity across the three performance states in every season. In 2022 and 2024, the median velocity during Hot states appears slightly higher than during some other states. However, the differences are small. In 2023, Hot-state velocity appears lower than Cold- and Neutral-state velocity, while the three distributions are broadly similar in 2025.
+
+Overall, the descriptive patterns do not show a consistent increase in four-seam fastball velocity when Harris entered an at-bat in a Hot state. Therefore, the observed hot-period performance does not appear to be explained by pitchers systematically responding with higher average four-seam velocity.
+
+These comparisons are descriptive and do not by themselves establish whether performance state caused a change in pitcher behavior. Harris faced different pitchers across the observed states, and pitchers naturally differ in their typical fastball velocity. Consequently, raw velocity differences may reflect changes in pitcher composition rather than adjustments made by the same pitchers.
+
+### 6.1.1 Check pitcher coverage across states
+
+```{r}
+pitcher_state_counts <- fastball_data %>%
+  count(
+    game_year,
+    pitcher,
+    prior_performance_state,
+    name = "number_of_fastballs"
+  )
+
+pitcher_state_counts
+```
+
+```{r}
+pitcher_coverage <- pitcher_state_counts %>%
+  group_by(
+    game_year,
+    pitcher
+  ) %>%
+  summarise(
+    total_fastballs = sum(number_of_fastballs),
+    
+    number_of_states_observed =
+      n_distinct(prior_performance_state),
+    
+    minimum_fastballs_per_state =
+      min(number_of_fastballs),
+    
+    .groups = "drop"
+  )
+
+pitcher_coverage
+```
+
+### 6.1.2 Select pitchers with comparable observations
+
+```{r}
+eligible_pitcher_states <- pitcher_state_counts %>%
+  filter(number_of_fastballs >= 5)
+```
+
+```{r}
+eligible_pitchers <- eligible_pitcher_states %>%
+  group_by(
+    game_year,
+    pitcher
+  ) %>%
+  summarise(
+    number_of_eligible_states =
+      n_distinct(prior_performance_state),
+    
+    total_eligible_fastballs =
+      sum(number_of_fastballs),
+    
+    .groups = "drop"
+  ) %>%
+  filter(number_of_eligible_states >= 2)
+
+eligible_pitchers
+```
+
+```{r}
+eligible_pitchers %>%
+  count(
+    game_year,
+    name = "number_of_eligible_pitchers"
+  )
+```
+
+the number of pitcher is too small, not worthy keep on analysis.
+
+### 6.1.3 upper tail velocity
+
+```{r}
+fastball_upper_tail <- fastball_data %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  summarise(
+    number_of_fastballs = n(),
+    
+    mean_velocity =
+      mean(release_speed),
+    
+    median_velocity =
+      median(release_speed),
+    
+    velocity_90th_percentile =
+      quantile(
+        release_speed,
+        probs = 0.90
+      ),
+    
+    velocity_95th_percentile =
+      quantile(
+        release_speed,
+        probs = 0.95
+      ),
+    
+    maximum_velocity =
+      max(release_speed),
+    
+    .groups = "drop"
+  )
+
+fastball_upper_tail
+```
+
+```{r}
+ggplot(
+  fastball_upper_tail,
+  aes(
+    x = prior_performance_state,
+    y = velocity_95th_percentile,
+    group = 1
+  )
+) +
+  geom_line(
+    color = "#636363",
+    linewidth = 0.7
+  ) +
+  geom_point(
+    aes(color = prior_performance_state),
+    size = 3
+  ) +
+  facet_wrap(
+    ~ game_year
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Cold",
+      "Neutral",
+      "Hot"
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "Cold" = "#2166AC",
+      "Neutral" = "#BDBDBD",
+      "Hot" = "#B2182B"
+    )
+  ) +
+  labs(
+    title = "Upper-Tail Four-Seam Fastball Velocity",
+    subtitle = "95th percentile of release speed by prior performance state",
+    x = "Harris's Prior Performance State",
+    y = "95th-Percentile Release Speed (mph)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+The 95th percentile of four-seam fastball velocity was compared across Harris's prior Cold, Neutral, and Hot performance states to determine whether pitchers used more high-velocity challenge pitches when he had recently performed well.
+
+The upper-tail velocity during prior-Hot states was lower than during prior-Neutral states in all four seasons. The difference was especially visible in 2023, when the Hot-state 95th-percentile velocity was approximately 1.7 mph lower than the Neutral-state value. Smaller Hot-versus-Neutral reductions were also observed in 2022, 2024, and 2025.
+
+The 2025 Hot-state upper-tail velocity was slightly higher than the Cold-state value but remained below the Neutral-state value. Overall, the results provide no descriptive evidence that pitchers responded to Harris's prior-Hot performance by using a greater concentration of exceptionally high-velocity four-seam fastballs.
+
+#### Overall Fastball-Velocity Interpretation
+
+The typical-velocity and upper-tail analyses lead to the same general conclusion. Average and median four-seam velocity did not consistently increase during prior-Hot states, and the 95th-percentile velocity was lower during Hot states than during Neutral states in every season.
+
+These results suggest that pitchers did not respond to Harris's recent strong performance by systematically increasing four-seam velocity or by using more extreme high-velocity challenge pitches. Therefore, changes in four-seam fastball velocity are unlikely to be the primary pitcher-side explanation for the observed performance streaks.
+
+The upper-tail comparisons are descriptive and do not include formal uncertainty intervals. The number and identity of pitchers differed across performance states, so the observed percentile differences may partly reflect pitcher composition. Nevertheless, the consistent absence of a Hot-state increase provides no support for the specific hypothesis that Harris faced harder four-seam fastballs after strong recent performance.
+
+
+## 6.2 Fastball Usage / Pitch Mix
+
+Compare four-seam fastball frequency and, if useful, broader pitch-type composition.
+
+
+Question:
+
+> Did pitchers change what they threw to Harris?
+
+```{r}
+pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(pitch_type)
+  ) %>%
+  count(
+    pitch_type,
+    pitch_name,
+    sort = TRUE
+  ) %>%
+  print(n = Inf)
+```
+
+```{r}
+four_seam_usage <- pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(pitch_type)
+  ) %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  summarise(
+    total_pitches = n(),
+    
+    four_seam_fastballs =
+      sum(pitch_type == "FF"),
+    
+    four_seam_usage_rate =
+      mean(pitch_type == "FF"),
+    
+    .groups = "drop"
+  )
+
+four_seam_usage
+```
+
+```{r}
+ggplot(
+  four_seam_usage,
+  aes(
+    x = prior_performance_state,
+    y = four_seam_usage_rate,
+    fill = prior_performance_state
+  )
+) +
+  geom_col(
+    width = 0.7
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(
+        four_seam_usage_rate,
+        accuracy = 0.1
+      )
+    ),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  facet_wrap(
+    ~ game_year
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Cold",
+      "Neutral",
+      "Hot"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(
+      0,
+      max(four_seam_usage$four_seam_usage_rate) * 1.15
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Cold" = "#2166AC",
+      "Neutral" = "#BDBDBD",
+      "Hot" = "#B2182B"
+    )
+  ) +
+  labs(
+    title = "Four-Seam Fastball Usage by Prior Performance State",
+    subtitle = "State is based on the previous 25 official at-bats",
+    x = "Harris's Prior Performance State",
+    y = "Four-Seam Fastball Usage Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+```{r}
+pitch_mix_summary <- pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(pitch_type),
+    !is.na(pitch_name)
+  ) %>%
+  count(
+    game_year,
+    prior_performance_state,
+    pitch_type,
+    pitch_name,
+    name = "number_of_pitches"
+  ) %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  mutate(
+    total_pitches = sum(number_of_pitches),
+    
+    usage_rate =
+      number_of_pitches /
+      total_pitches
+  ) %>%
+  ungroup()
+
+pitch_mix_summary
+```
+
+```{r}
+top_pitch_names <- pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(pitch_name)
+  ) %>%
+  count(
+    pitch_name,
+    sort = TRUE
+  ) %>%
+  slice_head(n = 8) %>%
+  pull(pitch_name)
+```
+
+```{r}
+pitch_mix_grouped <- pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(pitch_name)
+  ) %>%
+  mutate(
+    pitch_group = if_else(
+      pitch_name %in% top_pitch_names,
+      pitch_name,
+      "Other"
+    )
+  ) %>%
+  count(
+    game_year,
+    prior_performance_state,
+    pitch_group,
+    name = "number_of_pitches"
+  ) %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  mutate(
+    usage_rate =
+      number_of_pitches /
+      sum(number_of_pitches)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+ggplot(
+  pitch_mix_grouped,
+  aes(
+    x = prior_performance_state,
+    y = usage_rate,
+    fill = pitch_group
+  )
+) +
+  geom_col(
+    position = "fill"
+  ) +
+  facet_wrap(
+    ~ game_year
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Cold",
+      "Neutral",
+      "Hot"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent
+  ) +
+  labs(
+    title = "Pitch Mix by Harris's Prior Performance State",
+    subtitle = "Each bar represents the composition of pitches within a state",
+    x = "Prior Performance State",
+    y = "Share of Pitches",
+    fill = "Pitch Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+The pitch-mix distributions show some differences across Harris's prior performance states, but the patterns are generally modest and not completely consistent across seasons.
+
+Four-seam fastball usage did not increase when Harris entered an at-bat in a Hot state. In 2022 and especially 2024, the proportion of four-seam fastballs appears lower during Hot states, accompanied by somewhat greater use of sinkers, sliders, or other pitch types. The pitch-type distributions were more similar across states in 2023 and 2025.
+
+The 2024 season provides the clearest descriptive indication of a possible pitch-mix adjustment, with pitchers appearing to rely less on four-seam fastballs when Harris was previously Hot. In contrast, the unusually large performance variation observed in 2025 was not accompanied by an equally clear shift in aggregate pitch-type composition.
+
+Overall, the figure provides limited descriptive evidence that pitchers changed what they threw to Harris. Any adjustment appears to be season-specific rather than a consistent response across all four seasons.
+
+```{r}
+four_seam_comparison <- four_seam_usage %>%
+  select(
+    game_year,
+    prior_performance_state,
+    total_pitches,
+    four_seam_fastballs,
+    four_seam_usage_rate
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = prior_performance_state,
+    values_from = c(
+      total_pitches,
+      four_seam_fastballs,
+      four_seam_usage_rate
+    )
+  ) %>%
+  mutate(
+    hot_minus_neutral =
+      four_seam_usage_rate_Hot -
+      four_seam_usage_rate_Neutral,
+    
+    hot_minus_cold =
+      four_seam_usage_rate_Hot -
+      four_seam_usage_rate_Cold
+  )
+
+four_seam_comparison
+```
+
+
+Four-seam fastball usage was lower during prior-Hot states than during prior-Neutral states in all four seasons. The differences were approximately 5.6 percentage points in 2022, 2.4 points in 2023, 5.5 points in 2024, and 3.7 points in 2025.
+
+The largest Cold-to-Hot difference occurred in 2024, when four-seam usage decreased from approximately 43.0% during Cold states to 30.9% during Hot states.
+
+The consistency of the Hot-versus-Neutral direction across seasons provides a potentially meaningful descriptive pattern. It suggests that the aggregate pitch mix Harris faced contained fewer four-seam fastballs after periods of strong recent performance.
+
+However, these comparisons do not establish that individual pitchers intentionally changed their approach. The observed differences may partly reflect changes in pitcher composition, handedness, repertoire, count, or game context. Regression and sensitivity analyses are therefore required before interpreting the pattern as evidence of a pitcher response.
+
+
+```{r}
+pitch_mix_model_data <- pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(pitch_type)
+  ) %>%
+  mutate(
+    is_four_seam =
+      as.integer(pitch_type == "FF"),
+    
+    prior_performance_state = factor(
+      prior_performance_state,
+      levels = c(
+        "Neutral",
+        "Cold",
+        "Hot"
+      )
+    ),
+    
+    game_year = factor(game_year)
+  )
+```
+
+```{r}
+four_seam_model <- glm(
+  is_four_seam ~
+    prior_performance_state +
+    game_year,
+  
+  family = binomial,
+  data = pitch_mix_model_data
+)
+
+summary(four_seam_model)
+```
+
+A logistic regression was used to examine whether four-seam fastball usage differed across Harris's prior performance states while controlling for season. Neutral performance was used as the reference state.
+
+The estimated coefficient for the Hot state was negative ($\hat\beta=-0.186$, unadjusted $p=0.010$). The corresponding odds ratio was approximately 0.83, indicating that the estimated odds of receiving a four-seam fastball were about 17% lower during prior-Hot states than during prior-Neutral states after adjusting for season.
+
+The Cold-state coefficient was small and not statistically significant. These results provide preliminary evidence that the pitch mix Harris faced contained fewer four-seam fastballs after periods of strong recent performance.
+
+```{r}
+library(sandwich)
+library(lmtest)
+
+four_seam_clustered <- lmtest::coeftest(
+  four_seam_model,
+  vcov. = sandwich::vcovCL(
+    four_seam_model,
+    cluster = pitch_mix_model_data$pitcher
+  )
+)
+
+four_seam_clustered
+```
+
+```{r}
+four_seam_adjusted_model <- glm(
+  is_four_seam ~
+    prior_performance_state +
+    game_year +
+    p_throws +
+    factor(balls) +
+    factor(strikes),
+  
+  family = binomial,
+  data = pitch_mix_model_data
+)
+
+summary(four_seam_adjusted_model)
+```
+
+```{r}
+four_seam_adjusted_clustered <-
+  lmtest::coeftest(
+    four_seam_adjusted_model,
+    vcov. = sandwich::vcovCL(
+      four_seam_adjusted_model,
+      cluster = pitch_mix_model_data$pitcher
+    )
+  )
+
+four_seam_adjusted_clustered
+```
+
+```{r}
+model_comparison <- tibble::tibble(
+  model = c(
+    "Year-adjusted",
+    "Year, handedness, and count adjusted"
+  ),
+  
+  hot_estimate = c(
+    coef(four_seam_model)[
+      "prior_performance_stateHot"
+    ],
+    
+    coef(four_seam_adjusted_model)[
+      "prior_performance_stateHot"
+    ]
+  ),
+  
+  hot_odds_ratio = exp(hot_estimate)
+)
+
+model_comparison
+```
+
+#### Logistic-Regression Analysis of Four-Seam Usage
+
+A logistic-regression model was used to examine whether the probability of receiving a four-seam fastball differed across Harris's prior performance states. The dependent variable equaled 1 for a four-seam fastball and 0 for any other classified pitch.
+
+Neutral performance was used as the reference state. The first model adjusted for season. A second model additionally adjusted for pitcher handedness and the pre-pitch balls-strikes count, because pitch selection may vary systematically across handedness matchups and count situations.
+
+Because multiple pitches were observed from the same pitcher, pitcher-clustered standard errors were used to account for within-pitcher dependence.
+
+#### Four-Seam Usage Regression Results
+
+In the season-adjusted model, the estimated coefficient for the prior-Hot state was negative $\(\hat\beta=-0.186\)$, corresponding to an odds ratio of 0.831. After clustering the standard errors by pitcher, the association was suggestive but did not reach the conventional 0.05 significance level $\(p=0.085\)$.
+
+After additionally controlling for pitcher handedness and the balls-strikes count, the Hot-state coefficient remained similar in magnitude and direction $\(\hat\beta=-0.193\)$. The corresponding odds ratio was 0.825, indicating that the estimated odds of receiving a four-seam fastball were approximately 17.5% lower during prior-Hot states than during prior-Neutral states.
+
+With pitcher-clustered standard errors, the adjusted association remained suggestive rather than conventionally statistically significant $\(p=0.074\)$. The stability of the coefficient across the two model specifications indicates that the negative association was not explained by season, pitcher handedness, or the balls-strikes count.
+
+#### Interpretation
+
+The descriptive and regression results consistently point toward lower four-seam fastball usage after periods of strong recent performance. However, the association did not remain statistically significant at the 0.05 level after accounting for dependence among pitches thrown by the same pitcher.
+
+The evidence should therefore be interpreted as suggestive rather than conclusive. It is consistent with the possibility that the aggregate pitch mix Harris faced shifted away from four-seam fastballs when he entered an at-bat in a Hot state, but it does not establish that individual pitchers deliberately changed their strategy in response to his recent performance.
+
+```{r}
+hot_beta <- four_seam_adjusted_clustered[
+  "prior_performance_stateHot",
+  "Estimate"
+]
+
+hot_se <- four_seam_adjusted_clustered[
+  "prior_performance_stateHot",
+  "Std. Error"
+]
+
+hot_ci <- tibble::tibble(
+  estimate = hot_beta,
+  odds_ratio = exp(hot_beta),
+  lower_95_ci = exp(
+    hot_beta - 1.96 * hot_se
+  ),
+  upper_95_ci = exp(
+    hot_beta + 1.96 * hot_se
+  ),
+  clustered_p_value =
+    four_seam_adjusted_clustered[
+      "prior_performance_stateHot",
+      "Pr(>|z|)"
+    ]
+)
+
+hot_ci
+```
+After adjusting for season, pitcher handedness, and the balls-strikes count, the estimated odds of receiving a four-seam fastball during prior-Hot states were approximately 17.5% lower than during prior-Neutral states (OR = 0.825, 95% CI [0.667, 1.019]).
+
+After accounting for within-pitcher dependence using pitcher-clustered standard errors, the association was suggestive but did not reach the conventional 0.05 significance threshold $\(p=0.074\)$S. The confidence interval included 1, indicating that the data remain compatible with little or no true difference in four-seam usage.
+
+The negative Hot-state coefficient remained similar in the season-adjusted and fully adjusted models, suggesting that the estimated association was not explained by pitcher handedness or the balls-strikes count. Combined with the descriptive finding that Hot-state four-seam usage was lower than Neutral-state usage in all four seasons, the results provide suggestive evidence of a shift away from four-seam fastballs following periods of strong recent performance.
+
+However, the evidence is not conclusive. The observational design and limited number of repeated pitcher-state matchups prevent the result from being interpreted as proof that individual pitchers deliberately changed their strategy because Harris was Hot.
+
+
+
+## 6.3 Pitch Location
+
+Compare the locations of pitches Harris faced across Hot, Neutral, and Cold periods.
+
+### 6.3.1 Normalize pitch location
+
+```{r}
+pitch_location_data <- pitch_data_with_state %>%
+  filter(
+    !is.na(prior_performance_state),
+    !is.na(plate_x),
+    !is.na(plate_z),
+    !is.na(sz_top),
+    !is.na(sz_bot),
+    sz_top > sz_bot
+  ) %>%
+  mutate(
+    zone_middle =
+      (sz_top + sz_bot) / 2,
+    
+    zone_half_height =
+      (sz_top - sz_bot) / 2,
+    
+    normalized_plate_x =
+      plate_x / 0.83,
+    
+    normalized_plate_z =
+      (plate_z - zone_middle) /
+      zone_half_height,
+    
+    in_zone =
+      abs(normalized_plate_x) <= 1 &
+      abs(normalized_plate_z) <= 1,
+    
+    distance_from_zone_center =
+      sqrt(
+        normalized_plate_x^2 +
+        normalized_plate_z^2
+      )
+  )
+```
+
+
+Pitch location was standardized relative to the batter-specific strike-zone boundaries. Horizontal location was divided by an approximate strike-zone half-width of 0.83 feet. Vertical location was centered and scaled using the Statcast variables `sz_top` and `sz_bot`.
+
+After normalization, zero represents the center of the strike zone, while values of -1 and 1 represent the lower/left and upper/right boundaries. This transformation allows pitch locations to be compared on a common strike-zone scale.
+
+### 6.3.2 Summarize location by state
+
+```{r}
+pitch_location_summary <- pitch_location_data %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  summarise(
+    number_of_pitches = n(),
+    
+    zone_rate =
+      mean(in_zone),
+    
+    mean_horizontal_location =
+      mean(normalized_plate_x),
+    
+    mean_vertical_location =
+      mean(normalized_plate_z),
+    
+    mean_absolute_horizontal_location =
+      mean(abs(normalized_plate_x)),
+    
+    mean_distance_from_center =
+      mean(distance_from_zone_center),
+    
+    median_distance_from_center =
+      median(distance_from_zone_center),
+    
+    .groups = "drop"
+  )
+
+pitch_location_summary
+```
+
+### 6.3.3 Plot zone rate
+
+```{r}
+ggplot(
+  pitch_location_summary,
+  aes(
+    x = prior_performance_state,
+    y = zone_rate,
+    fill = prior_performance_state
+  )
+) +
+  geom_col(
+    width = 0.7
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(
+        zone_rate,
+        accuracy = 0.1
+      )
+    ),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  facet_wrap(
+    ~ game_year
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Cold",
+      "Neutral",
+      "Hot"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(
+      0,
+      max(pitch_location_summary$zone_rate) *
+        1.15
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Cold" = "#2166AC",
+      "Neutral" = "#BDBDBD",
+      "Hot" = "#B2182B"
+    )
+  ) +
+  labs(
+    title = "Strike-Zone Rate by Prior Performance State",
+    subtitle = "Zone boundaries are standardized using Statcast sz_top and sz_bot",
+    x = "Harris's Prior Performance State",
+    y = "Percentage of Pitches in the Strike Zone"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+### 6.3.4 Plot distane from zone center
+
+```{r}
+ggplot(
+  pitch_location_data,
+  aes(
+    x = prior_performance_state,
+    y = distance_from_zone_center,
+    fill = prior_performance_state
+  )
+) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.alpha = 0.15
+  ) +
+  facet_wrap(
+    ~ game_year
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Cold",
+      "Neutral",
+      "Hot"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Cold" = "#2166AC",
+      "Neutral" = "#BDBDBD",
+      "Hot" = "#B2182B"
+    )
+  ) +
+  labs(
+    title = "Pitch Distance from the Strike-Zone Center",
+    subtitle = "Larger values indicate pitches farther from the center",
+    x = "Harris's Prior Performance State",
+    y = "Normalized Distance from Zone Center"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none"
+  )
+```
+
+### 6.3.5 Visualize two dimensional pitch location
+
+```{r}
+for (yr in sort(unique(
+  pitch_location_data$game_year
+))) {
+  
+  year_location <- pitch_location_data %>%
+    filter(game_year == yr)
+  
+  p <- ggplot(
+    year_location,
+    aes(
+      x = normalized_plate_x,
+      y = normalized_plate_z
+    )
+  ) +
+    geom_density_2d_filled(
+      contour_var = "ndensity",
+      alpha = 0.75
+    ) +
+    geom_rect(
+      xmin = -1,
+      xmax = 1,
+      ymin = -1,
+      ymax = 1,
+      fill = NA,
+      color = "black",
+      linewidth = 0.8
+    ) +
+    facet_wrap(
+      ~ prior_performance_state,
+      nrow = 1
+    ) +
+    coord_fixed(
+      xlim = c(-2.5, 2.5),
+      ylim = c(-2.5, 2.5)
+    ) +
+    labs(
+      title = paste(
+        "Pitch Location Density:",
+        yr
+      ),
+      subtitle = "The black rectangle represents the normalized strike zone",
+      x = "Normalized Horizontal Location",
+      y = "Normalized Vertical Location",
+      fill = "Density"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position = "bottom"
+    )
+  
+  print(p)
+}
+```
+
+### 6.3.6 control for pitch type and count
+
+```{r}
+pitch_location_model_data <-
+  pitch_location_data %>%
+  mutate(
+    in_zone_numeric =
+      as.integer(in_zone),
+    
+    prior_performance_state = factor(
+      prior_performance_state,
+      levels = c(
+        "Neutral",
+        "Cold",
+        "Hot"
+      )
+    ),
+    
+    game_year = factor(game_year)
+  )
+```
+
+```{r}
+zone_rate_model <- glm(
+  in_zone_numeric ~
+    prior_performance_state +
+    game_year +
+    pitch_type +
+    p_throws +
+    factor(balls) +
+    factor(strikes),
+  
+  family = binomial,
+  data = pitch_location_model_data
+)
+```
+
+```{r}
+zone_rate_clustered <- lmtest::coeftest(
+  zone_rate_model,
+  vcov. = sandwich::vcovCL(
+    zone_rate_model,
+    cluster =
+      pitch_location_model_data$pitcher
+  )
+)
+
+zone_rate_clustered
+```
+
+
+---
+
+# 7. Mechanism Analysis II — Did Harris's Behavior Change?
+
+pitcher behavior does not explain the pattern well, then we examine Harris himself.
+
+## 7.1 Swing Location / Swing Decisions
+
+Restrict analysis to pitches where Harris swung.
+
+Compare the distribution of `plate_x` and `plate_z` across:
+
+* Hot
+* Neutral
+* Cold
+
+Question:
+
+> Did Harris change which pitches he chose to attack?
+
+A similar swing-location distribution would suggest that his basic swing-selection pattern remained relatively stable.
+
+- *tips 1 * now when we researching the swing decisions, we cannot only keep the pitches that harris swing, cause 'no swing' is already a swing decision.
+
+- *tips 2 * when researching the 'batting average by location', we cannot copy the current 'at-bat' final hit result to every pitches in this 'at-bat'. We have to use every 'official at-bat''s terminal pitch to make sure every 'at-bat' only count once.
+
+```{r}
+# A. insert pitch descriptions
+pitch_location_data %>%
+  count(
+    description,
+    sort = TRUE
+  ) %>%
+  print(n = Inf)
+
+
+
+
+
+#B.  Define swing and contact indicators
+swing_descriptions <- c(
+  "swinging_strike",
+  "swinging_strike_blocked",
+  "foul",
+  "foul_tip",
+  "foul_bunt",
+  "missed_bunt",
+  "bunt_foul_tip",
+  "hit_into_play"
+)
+
+contact_descriptions <- c(
+  "foul",
+  "foul_tip",
+  "foul_bunt",
+  "bunt_foul_tip",
+  "hit_into_play"
+)
+
+
+
+swing_data <- pitch_location_data %>%
+  mutate(
+    is_swing =
+      description %in% swing_descriptions,
+    # when is_swing =True: harris swing this ball
+    # if is_swing = flase: no swing
+    
+    made_contact =
+      description %in% contact_descriptions
+    # if made_contact=true: swing did not touch this ball
+  )
+
+## check
+#swing_data %>%
+#  count(
+#    description,
+#    is_swing,
+#    made_contact,
+#    sort = TRUE
+#  ) %>%
+#  print(n = Inf)
+  
+  
+  
+# C. Calculate swing-decision metrics
+swing_decision_summary <- swing_data %>%
+  group_by(
+    game_year,
+    prior_performance_state
+  ) %>%
+  summarise(
+    total_pitches = n(),
+    
+    #if harris swing more
+    overall_swing_rate =
+      mean(is_swing),
+    
+    zone_pitches =
+      sum(in_zone),
+    
+     #if more positive to the pitches in zone
+    zone_swing_rate =
+      mean(is_swing[in_zone]),
+    
+    outside_pitches =
+      sum(!in_zone),
+    
+    #if chase more to the pitches outside the zone
+    chase_rate =
+      mean(is_swing[!in_zone]),
+    
+    total_swings =
+      sum(is_swing),
+    
+    # if more easier to touch the ball after swing
+    contact_rate =
+      mean(made_contact[is_swing]),
+    
+    .groups = "drop"
+  )
+
+# swing_decision_summary
+```
+
+
+```{r}
+#|  fig-height: 7
+
+
+# D. Reshape and plot
+swing_plot_data <- swing_decision_summary %>%
+  select(
+    game_year,
+    prior_performance_state,
+    overall_swing_rate,
+    zone_swing_rate,
+    chase_rate,
+    contact_rate
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(
+      overall_swing_rate,
+      zone_swing_rate,
+      chase_rate,
+      contact_rate
+    ),
+    names_to = "metric",
+    values_to = "rate"
+  ) %>%
+  mutate(
+    metric = recode(
+      metric,
+      overall_swing_rate = "Overall Swing Rate",
+      zone_swing_rate = "Zone Swing Rate",
+      chase_rate = "Chase Rate",
+      contact_rate = "Contact Rate"
+    )
+  )
+
+
+
+ggplot(
+  swing_plot_data,
+  aes(
+    x = prior_performance_state,
+    y = rate,
+    color = prior_performance_state,
+    group = 1
+  )
+) +
+  geom_line(
+    color = "#636363",
+    linewidth = 0.6
+  ) +
+  geom_point(
+    size = 3
+  ) +
+  facet_grid(
+    metric ~ game_year,
+    scales = "free_y"
+  ) +
+  scale_x_discrete(
+    limits = c(
+      "Cold",
+      "Neutral",
+      "Hot"
+    )
+  ) +
+  scale_y_continuous(
+    labels = scales::percent
+  ) +
+  scale_color_manual(
+    values = c(
+      "Cold" = "#2166AC",
+      "Neutral" = "#BDBDBD",
+      "Hot" = "#B2182B"
+    )
+  ) +
+  labs(
+    title = "Swing Decisions by Prior Performance State",
+    subtitle = "Performance state is based on the previous 25 official at-bats",
+    x = "Harris's Prior Performance State",
+    y = "Rate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none"
+  )
+```
+Harris’s swing behavior varied across performance states, but the direction of these differences was not consistent across seasons. In 2022 and 2023, his overall and in-zone swing rates were generally lower during Hot periods, whereas the 2024 Hot state was associated with a higher chase rate. In 2025, the Hot and Neutral states had similar zone-swing rates, while contact was somewhat higher during the Hot state. Overall, the descriptive evidence does not indicate one stable change in swing strategy that consistently accompanies Hot performance.
+
+#### possible explore area: if harris change his stragety each year, did he performance better?
+
+Harris’s season batting average declined from .297 in 2022 to .249 in 2025. Therefore, the observed changes in swing decisions should not automatically be interpreted as improvements in overall batting performance.
+
+## 7.2 Hit Outcome by Terminal-Pitch Location
+
+Now ask a different question:
+
+> Even if Harris swung at similar locations, was he more successful across those locations when hot?
+
+Divide the plate into spatial bins and calculate BA within each region.
+
+Compare Hot vs Neutral vs Cold.
+
+Possible pattern:
+
+* Hot → broader high-performance region
+* Cold → success concentrated in fewer areas
+* Neutral → intermediate pattern
+
+This would suggest that Harris's **ability to produce hits across the zone**, rather than simply his choice of pitches, changes with performance state.
+
+```{r}
+# A.  Create one row per official at-bat
+## Each line represent a "official at-bat",
+## 'plate_x' and 'plate_z' is the final pitch location for current 'at-bat'
+terminal_ab_location <- pa_with_state %>%
+  filter(
+    official_at_bat == 1,
+    !is.na(hit),
+    !is.na(plate_x),
+    !is.na(plate_z),
+    !is.na(sz_top),
+    !is.na(sz_bot),
+    !is.na(prior_performance_state),
+    sz_top > sz_bot
+  ) %>%
+  mutate(
+    zone_middle =
+      (sz_top + sz_bot) / 2,
+    
+    zone_half_height =
+      (sz_top - sz_bot) / 2,
+    
+    normalized_plate_x =
+      plate_x / 0.83,
+    
+    normalized_plate_z =
+      (plate_z - zone_middle) /
+      zone_half_height
+  )
+```
+
+
+```{r}
+# B. Divide the plate into spatial regions
+terminal_ab_location <- terminal_ab_location %>%
+  mutate(
+    horizontal_region = case_when(
+      normalized_plate_x < -1 ~ "Left of Zone",
+      normalized_plate_x > 1 ~ "Right of Zone",
+      TRUE ~ "Within Zone Width"
+    ),
+    
+    vertical_region = case_when(
+      normalized_plate_z < -1 ~ "Below Zone",
+      normalized_plate_z > 1 ~ "Above Zone",
+      TRUE ~ "Within Zone Height"
+    ),
+    
+    location_region = paste(
+      vertical_region,
+      horizontal_region,
+      sep = " / "
+    )
+  )
+```
+
+
+```{r}
+# C. Calculate hit rates
+location_hit_summary <- terminal_ab_location %>%
+  group_by(
+    game_year,
+    prior_performance_state,
+    vertical_region,
+    horizontal_region
+  ) %>%
+  summarise(
+    official_at_bats = n(),
+    hits = sum(hit),
+    hit_rate = mean(hit),
+    .groups = "drop"
+  )
+
+# Check the sample size in each location cell
+#location_hit_summary %>%
+#  arrange(
+#    official_at_bats
+#  )
+
+
+location_hit_plot_data <- location_hit_summary %>%
+  filter(official_at_bats >= 10)
+
+```
+
+
+```{r}
+# D. Heatmap
+
+#| fig-width: 20
+
+ggplot(
+  location_hit_plot_data,
+  aes(
+    x = horizontal_region,
+    y = vertical_region,
+    fill = hit_rate
+  )
+) +
+  geom_tile(
+    color = "white"
+  ) +
+  geom_text(
+    aes(
+      label = paste0(
+        scales::percent(
+          hit_rate,
+          accuracy = 1
+        ),
+        "\n(n=",
+        official_at_bats,
+        ")"
+      )
+    ),
+    size = 3
+  ) +
+  facet_grid(
+    prior_performance_state ~ game_year
+  ) +
+  scale_fill_gradient(
+    low = "#F7FBFF",
+    high = "#08519C",
+    labels = scales::percent
+  ) +
+  labs(
+    title = "Hit Rate by Terminal-Pitch Location",
+    subtitle = "Cells with fewer than 10 official at-bats are omitted",
+    x = "Horizontal Location",
+    y = "Vertical Location",
+    fill = "Hit Rate"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(
+      angle = 30,
+      hjust = 1
+    )
+  )
+```
+
+The terminal-pitch location analysis provides limited evidence of a consistent spatial change in Harris’s hitting success. Some Hot-state cells show relatively high hit rates, but these patterns differ across seasons and are frequently based on small numbers of official at-bats. Many Hot and Cold cells contained fewer than 10 observations and were therefore omitted. Consequently, the apparent differences may reflect sampling variability rather than stable changes in location-specific hitting ability.
+
+*combine the seasons cause the data size*
+
+```{r}
+# Statcast descriptions indicating that the batter attempted a swing
+swing_descriptions <- c(
+  "swinging_strike",
+  "swinging_strike_blocked",
+  "foul",
+  "foul_tip",
+  "foul_bunt",
+  "missed_bunt",
+  "bunt_foul_tip",
+  "hit_into_play"
+)
+
+# Swing attempts that did not produce contact
+miss_descriptions <- c(
+  "swinging_strike",
+  "swinging_strike_blocked",
+  "missed_bunt"
+)
+
+pitch_data_with_state <- pitch_data_with_state %>%
+  mutate(
+    # Whether Harris swung at the pitch
+    is_swing = description %in% swing_descriptions,
+
+    # Whether a swing produced contact
+    made_contact = case_when(
+      is_swing & description %in% miss_descriptions ~ FALSE,
+      is_swing ~ TRUE,
+      TRUE ~ NA
+    ),
+
+    # Standardized pitch location relative to Harris's strike zone
+    normalized_plate_x = plate_x / 0.83,
+
+    zone_middle = (sz_top + sz_bot) / 2,
+    zone_half_height = (sz_top - sz_bot) / 2,
+
+    normalized_plate_z =
+      (plate_z - zone_middle) / zone_half_height,
+
+    # Whether the pitch passed through the estimated strike zone
+    in_zone =
+      abs(normalized_plate_x) <= 1 &
+      abs(normalized_plate_z) <= 1
+  )
+```
+
+
+```{r}
+yearly_swing_summary <- pitch_data_with_state %>%
+  filter(!is.na(game_year)) %>%
+  group_by(game_year) %>%
+  summarise(
+    total_pitches = n(),
+
+    overall_swing_rate = mean(is_swing, na.rm = TRUE),
+
+    zone_swing_rate = mean(
+      is_swing[in_zone == TRUE],
+      na.rm = TRUE
+    ),
+
+    chase_rate = mean(
+      is_swing[in_zone == FALSE],
+      na.rm = TRUE
+    ),
+
+    contact_rate = mean(
+      made_contact[is_swing == TRUE],
+      na.rm = TRUE
+    ),
+
+    .groups = "drop"
+  )
+
+yearly_swing_summary
+
+
+yearly_swing_long <- yearly_swing_summary %>%
+  select(
+    game_year,
+    overall_swing_rate,
+    zone_swing_rate,
+    chase_rate,
+    contact_rate
+  ) %>%
+  tidyr::pivot_longer(
+    cols = -game_year,
+    names_to = "metric",
+    values_to = "rate"
+  )
+
+ggplot(
+  yearly_swing_long,
+  aes(
+    x = factor(game_year),
+    y = rate,
+    group = metric,
+    color = metric
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Harris's Swing Decisions by Season",
+    subtitle = "Season-level swing, chase, and contact rates",
+    x = "Season",
+    y = "Rate",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+Harris’s season-level swing profile suggests that he became more aggressive from 2022 to 2025. His overall swing rate increased from approximately 52% to 57%, while his swing rate on pitches inside the strike zone increased from approximately 68% to 72%. However, his chase rate also increased from approximately 40% to 44%, indicating that the increase in aggression extended to pitches outside the strike zone. His contact rate remained relatively stable, fluctuating between approximately 74% and 78%. Overall, Harris swung more frequently over time without an obvious decline in his ability to make contact, although he also expanded his swings toward more pitches outside the strike zone.
+
+
+
+
+---
+
+
+# 8. Batted-Ball Analysis
+
+The previous sections examined whether pitchers changed their approach and
+whether Harris changed his swing decisions across prior performance states.
+This section focuses on what happened after Harris put the ball into play.
+
+The analysis uses one observation per batted ball and compares Hot, Neutral,
+and Cold periods defined by Harris's performance over the previous 25
+official at-bats.
+
+
+## 8.1 Spray Chart
+
+Spray charts are used to examine the spatial distribution of Harris's
+batted balls across prior performance states.
+
+The Statcast variables `hc_x` and `hc_y` represent the horizontal and
+vertical coordinates of a batted ball on the field.
+
+
+Questions:
+
+>  Did Harris distribute batted balls differently during Hot, Neutral, and Cold periods?
+
+> Did he use a wider or narrower portion of the field during Hot periods?
+
+> Did the direction of successful batted balls differ across performance states?
+
+The first analysis should include all balls put into play. A second,
+exploratory analysis may restrict the sample to hits to examine the
+locations of successful outcomes.
+
+Spray patterns are treated as descriptive evidence. A wider or more
+concentrated distribution should not automatically be interpreted as
+better bat control because batted-ball direction may also be influenced by
+pitch location, pitch type, defensive positioning, and random variation.
+
+
+This analysis examines whether Harris distributed his batted balls differently following Hot, Neutral, and Cold periods. The data were restricted to terminal pitches on which the ball was put into play and valid Statcast hit coordinates were available. Both hits and outs were retained so that the analysis represents Harris’s complete batted-ball distribution rather than only successful outcomes. The Statcast hit coordinates were centered around home plate for visualization. Performance state was determined from the previous 25 official at-bats, preventing the current batted-ball outcome from being used to define its own state.
+```{r}
+# Outcomes classified as hits
+hit_events <- c(
+  "single",
+  "double",
+  "triple",
+  "home_run"
+)
+
+# Keep one row for every ball put into play
+batted_ball_data <- pitch_data_with_state %>%
+  filter(
+    description == "hit_into_play",
+    !is.na(hc_x),
+    !is.na(hc_y),
+    !is.na(prior_performance_state)
+  ) %>%
+  mutate(
+    is_hit = events %in% hit_events,
+
+    batted_ball_result = if_else(
+      is_hit,
+      "Hit",
+      "Out"
+    ),
+
+    prior_performance_state = factor(
+      prior_performance_state,
+      levels = c("Cold", "Neutral", "Hot")
+    )
+  )
+```
+
+```{r}
+batted_ball_sample_size <- batted_ball_data %>%
+  count(
+    game_year,
+    prior_performance_state,
+    name = "number_of_batted_balls"
+  ) %>%
+  tidyr::complete(
+    game_year,
+    prior_performance_state,
+    fill = list(number_of_batted_balls = 0)
+  )
+
+batted_ball_sample_size
+```
+
+
+```{r}
+batted_ball_data <- batted_ball_data %>%
+  mutate(
+    spray_x = hc_x - 125,
+    spray_y = 200 - hc_y
+  )
+```
+
+```{r}
+batted_ball_data %>%
+  summarise(
+    minimum_x = min(spray_x, na.rm = TRUE),
+    maximum_x = max(spray_x, na.rm = TRUE),
+    minimum_y = min(spray_y, na.rm = TRUE),
+    maximum_y = max(spray_y, na.rm = TRUE)
+  )
+```
+
+```{r}
+ggplot(
+  batted_ball_data,
+  aes(
+    x = spray_x,
+    y = spray_y,
+    color = batted_ball_result
+  )
+) +
+  geom_point(
+    alpha = 0.45,
+    size = 1.6
+  ) +
+  geom_segment(
+    aes(
+      x = 0,
+      y = 0,
+      xend = -100,
+      yend = 100
+    ),
+    inherit.aes = FALSE,
+    color = "gray50",
+    linewidth = 0.6
+  ) +
+  geom_segment(
+    aes(
+      x = 0,
+      y = 0,
+      xend = 100,
+      yend = 100
+    ),
+    inherit.aes = FALSE,
+    color = "gray50",
+    linewidth = 0.6
+  ) +
+  facet_wrap(
+    ~ prior_performance_state,
+    nrow = 1
+  ) +
+  coord_fixed() +
+  scale_color_manual(
+    values = c(
+      "Out" = "gray65",
+      "Hit" = "#2166AC"
+    )
+  ) +
+  labs(
+    title = "Michael Harris II's Batted-Ball Distribution",
+    subtitle = paste(
+      "All balls put into play, pooled across seasons;",
+      "performance state is based on the previous 25 official at-bats"
+    ),
+    x = "Horizontal Spray Coordinate",
+    y = "Transformed Statcast Vertical Coordinate",
+    color = "Result"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+The spray charts are treated as descriptive and exploratory evidence. Differences in point concentration do not necessarily indicate improved bat control or contact quality. Spray direction may also depend on pitch location, pitch type, pitcher handedness, defensive positioning, and random sampling variation. In addition, the Hot and Cold states may contain fewer batted balls than the Neutral state, making direct visual comparisons less stable.
+
+The pooled spray charts show that Harris distributed balls in play across a broad range of field locations during Cold, Neutral, and Hot periods. The Neutral panel contains substantially more observations because most rolling-performance windows were classified as Neutral. Visually, the three states exhibit considerable overlap, and the plot does not reveal an immediately distinct Hot-state spray pattern. Hits appear more frequently among deeper batted-ball locations, while many shorter batted balls resulted in outs. However, this pattern should not be interpreted as evidence of a Hot-state mechanism because batted-ball depth is related to trajectory, contact quality, and defensive outcomes.
+
+There is some visual indication that the horizontal distribution may differ across performance states, but a numerical comparison of directional percentages is required before drawing conclusions.
+
+## 8.2 Batted-Ball Direction Summary
+
+To supplement the spray charts, batted balls may be classified into broad
+directional categories:
+
+- Pull
+- Center
+- Opposite field
+
+The percentage of batted balls in each direction is then compared across
+Hot, Neutral, and Cold periods and across seasons.
+
+This summary provides a clearer numerical description of any spatial
+differences visible in the spray charts.
+
+```{r}
+batted_ball_data <- batted_ball_data %>%
+  mutate(
+    spray_angle =
+      atan2(spray_x, spray_y) * 180 / pi,
+
+    spray_direction = case_when(
+      spray_angle < -15 ~ "Left Side",
+      spray_angle > 15  ~ "Right Side",
+      TRUE              ~ "Center"
+    ),
+
+    spray_direction = factor(
+      spray_direction,
+      levels = c(
+        "Left Side",
+        "Center",
+        "Right Side"
+      )
+    )
+  )
+```
+
+```{r}
+spray_direction_summary <- batted_ball_data %>%
+  count(
+    prior_performance_state,
+    spray_direction,
+    name = "number_of_batted_balls"
+  ) %>%
+  group_by(prior_performance_state) %>%
+  mutate(
+    total_batted_balls =
+      sum(number_of_batted_balls),
+
+    direction_percentage =
+      number_of_batted_balls /
+      total_batted_balls
+  ) %>%
+  ungroup()
+
+spray_direction_summary
+```
+
+```{r}
+ggplot(
+  spray_direction_summary,
+  aes(
+    x = prior_performance_state,
+    y = direction_percentage,
+    fill = spray_direction
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.9)
+  ) +
+  geom_text(
+    aes(
+      label = scales::percent(
+        direction_percentage,
+        accuracy = 0.1
+      )
+    ),
+    position = position_dodge(width = 0.9),
+    vjust = -0.4,
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    limits = c(0, 0.50)
+  ) +
+  labs(
+    title = "Batted-Ball Direction by Prior Performance State",
+    subtitle = "All balls put into play, pooled across seasons",
+    x = "Prior Performance State",
+    y = "Percentage of Batted Balls",
+    fill = "Spray Direction"
+  ) +
+  theme_minimal(base_size = 12)
+```
+Harris’s pooled batted-ball direction was broadly similar across Cold, Neutral, and Hot periods. The right side of the field was the most common direction in every state, accounting for approximately 41%–45% of balls in play, while approximately 31% were directed toward the center. Compared with Neutral periods, Hot periods showed a slightly higher percentage of batted balls to the left side and a slightly lower percentage to the right side. However, these differences were modest, and the Hot distribution was also similar to the Cold distribution. Therefore, the descriptive results do not provide strong evidence that Harris adopted a distinctly different spray strategy during Hot periods.
+
+```{r}
+spray_direction_table <- table(
+  batted_ball_data$prior_performance_state,
+  batted_ball_data$spray_direction
+)
+
+spray_direction_table
+
+spray_chisq_test <- chisq.test(
+  spray_direction_table
+)
+
+spray_chisq_test
+
+spray_chisq_test$expected
+```
+
+```{r}
+library(effectsize)
+
+cramers_v(spray_direction_table)
+```
+
+```{r}
+spray_chisq_test <- chisq.test(
+  spray_direction_table
+)
+
+n_batted_balls <- sum(
+  spray_direction_table
+)
+
+number_of_rows <- nrow(
+  spray_direction_table
+)
+
+number_of_columns <- ncol(
+  spray_direction_table
+)
+
+cramers_v_manual <- sqrt(
+  as.numeric(spray_chisq_test$statistic) /
+    (
+      n_batted_balls *
+        min(
+          number_of_rows - 1,
+          number_of_columns - 1
+        )
+    )
+)
+
+cramers_v_manual
+```
+
+A Pearson chi-square test was used to examine whether batted-ball direction was associated with Harris’s prior performance state. The expected count in every cell exceeded five, satisfying the expected-frequency requirement of the test. The association was not statistically significant, $\chi^2(4)=2.15$, p=.708. The estimated effect size was also very small, Cramér’s $V≈.027$. Therefore, the pooled data provide little evidence that Harris systematically changed his overall batted-ball direction across Cold, Neutral, and Hot periods.
+
+
+Although Hot periods showed a slightly higher percentage of batted balls to the left side than Neutral periods, the overall directional distributions were similar. These small descriptive differences were not supported by the chi-square test.
+
+## 8.3 Contact Quality
+
+If the relevant Statcast variables are available, contact quality should be
+compared across prior performance states using measures such as:
+
+- Exit velocity (`launch_speed`)
+- Launch angle (`launch_angle`)
+- Hard-hit rate
+- Barrel rate
+- Expected batting average (`estimated_ba_using_speedangle`)
+
+Research question:
+
+Did Harris produce stronger or more favorable contact during Hot periods,
+even if his swing decisions remained relatively similar?
+
+Contact-quality measures are more directly related to the quality of a
+batted ball than spray-chart concentration alone.
+
+## Future Work
+
+Future work could extend the batted-ball analysis by examining exit
+velocity, launch angle, hard-hit rate, and expected batting average.
+Additional models could also account for pitcher identity, pitch
+location, pitch type, and dependence created by overlapping rolling
+windows.
+
+## 8.4 Interpretation and Limitations
+
+The batted-ball analysis is exploratory and is intended to identify
+possible mechanisms associated with Harris's performance states.
+
+Differences in spray direction or contact quality do not by themselves
+establish that a change in batting behavior caused a Hot period. Hot and
+Cold samples may also be relatively small, and the performance states are
+constructed from overlapping 25-at-bat rolling windows.
+
+Therefore, the results should be interpreted as descriptive evidence of
+how Harris's batted-ball outcomes differed across prior performance states,
+rather than as causal evidence of a hot-hand mechanism.
+
+## 8.5 Possible Extensions
+
+Possible extensions include:
+
+1. Adjusting batted-ball direction for pitch location and pitch type.
+2. Comparing ground-ball, line-drive, fly-ball, and popup rates.
+3. Modeling the probability of a hard-hit ball or hit using performance
+   state and season.
+4. Comparing observed outcomes with expected outcomes based on contact
+   quality.
+5. Conducting year-specific analyses when the sample size is sufficient.
+
+---
+

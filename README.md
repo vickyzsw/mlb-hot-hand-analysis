@@ -102,9 +102,15 @@ mlb-hot-hand-analysis/
 ## Project Files
 
 * [R Markdown analysis](analysis/mlb-analysis.Rmd)
-* [Rendered HTML report](docs/index.html)
+* [View the full interactive HTML report](https://vickyzsw.github.io/mlb-hot-hand-analysis/)
 * [Project presentation](presentation/final-presentation.pdf)
 * [Data codebook](references/mlb-data-codebook.html)
+**[View the published interactive report →](https://vickyzsw.github.io/mlb-hot-hand-analysis/)**
+
+The report presents the rolling batting-average analysis, Monte Carlo simulation, year-by-year results, and exploratory analyses of pitcher and batter behavior.
+
+- [View the R Markdown source](report/mlb-hot-hand-report.Rmd)
+- [View the detailed research workflow](analysis/mlb-analysis.Rmd)
 
 ## Tools and Packages
 

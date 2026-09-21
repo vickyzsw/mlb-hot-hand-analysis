@@ -6,7 +6,7 @@ A statistical analysis of short-term batting-performance streakiness using MLB S
 
 Sports fans often interpret consecutive successes and failures as evidence that a player is “hot” or “cold.” However, visible streaks can also occur naturally in random sequences.
 
-This project investigates whether Michael Harris II’s batting performance during the 2022–2025 MLB seasons exhibited more short-term variation than would be expected under a model of independent hitting outcomes.
+This project investigates whether Michael Harris II’s batting performance during the 2022–2025 MLB seasons exhibited more short-term variation than would be expected under models with no temporal streakiness. It is a reproducible research system: analysis notebooks are paired with reusable statistical functions and automated tests.
 
 The analysis first compares Harris’s observed rolling batting-average patterns with simulated random seasons. It then explores whether unusually strong or weak periods were associated with changes in pitcher behavior, Harris’s swing decisions, or his batted-ball patterns.
 
@@ -27,6 +27,7 @@ The analysis first compares Harris’s observed rolling batting-average patterns
 6. Compare the observed rolling-BA variance with the Monte Carlo null distribution.
 7. Define prior Hot, Neutral, and Cold performance states for exploratory mechanism analysis.
 8. Compare pitcher behavior, swing decisions, terminal-pitch location, and batted-ball direction across performance states.
+9. Stress-test conclusions with alternate window sizes, lag-1 correlation, longest-run statistics, within-season permutation, and a context-aware Bernoulli benchmark.
 
 ## Data
 
@@ -77,12 +78,21 @@ The mechanism analyses did not identify one definitive explanation for the unusu
 
 Overall, the results provide evidence of unusually high streakiness in Harris’s 2025 season, but they do not establish a single causal hot-hand mechanism.
 
+### Robustness interpretation
+
+The 2025 rolling-variance result remains extreme under the Bernoulli (`p ≈ .0002`), permutation (`p ≈ .0014`), and context-aware (`p ≈ .0008`) benchmarks. That result does **not** imply unusually strong adjacent dependence: the 2025 lag-1 result is `r = .045`, `p ≈ .124`, and a six-hit longest run has `p ≈ .100`. The evidence therefore concerns broader local performance variation, not a causal hot-hand effect or a single extraordinary run.
+
 ## Repository Structure
 
 ```text
 mlb-hot-hand-analysis/
 ├── analysis/
-│   └── mlb-analysis.Rmd
+│   ├── main-analysis.Rmd
+│   ├── mlb-analysis.Rmd
+│   └── robustness-analysis.Rmd
+├── R/
+│   ├── prepare_analysis_data.R
+│   └── streak_statistics.R
 ├── data/
 │   ├── README.md
 │   ├── savant_data.csv
@@ -94,6 +104,8 @@ mlb-hot-hand-analysis/
 ├── references/
 │   ├── mlb-data-codebook.Rmd
 │   └── mlb-data-codebook.html
+├── tests/testthat/
+├── .github/workflows/r-tests.yml
 ├── .gitignore
 ├── mlb-hot-hand-analysis.Rproj
 └── README.md
@@ -102,6 +114,8 @@ mlb-hot-hand-analysis/
 ## Project Files
 
 * [R Markdown analysis](analysis/mlb-analysis.Rmd)
+* [Primary analysis](analysis/main-analysis.Rmd)
+* [Robustness analysis](analysis/robustness-analysis.Rmd)
 * [View the full interactive HTML report](https://vickyzsw.github.io/mlb-hot-hand-analysis/)
 * [Project presentation](presentation/final-presentation.pdf)
 * [Data codebook](references/mlb-data-codebook.html)
@@ -124,6 +138,8 @@ The report presents the rolling batting-average analysis, Monte Carlo simulation
 ## Limitations
 
 The Bernoulli null model assumes that official at-bats are independent and that the underlying hit probability remains constant within each season. The overlapping rolling windows also create dependence among adjacent rolling averages.
+
+The context-aware benchmark is conditional on a model fitted to the same observed seasons. It is a useful sensitivity check, but model estimation uncertainty is not fully propagated; its p-value should not be read as a confirmatory causal test. The analysis is a single-player study, and specification checks are reported as complementary estimands rather than interchangeable proofs.
 
 The pitcher- and batter-mechanism analyses are exploratory. Differences across performance states should not be interpreted as causal effects because pitch selection, pitcher identity, game context, and other factors may also influence the observed patterns.
 

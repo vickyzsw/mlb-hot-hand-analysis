@@ -1,0 +1,1019 @@
+---
+title: "MLB Hot-Hand Analysis"
+author: "Shenwei Zhang"
+date: "2026-09-10"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(readr)
+```
+
+# Research Question
+
+# Data and Outcome Construction
+
+## Raw Statcast Data
+
+The analysis uses MLB Statcast pitch-level data for Michael Harris II across the 2022–2025 seasons. Each *row* of the raw dataset represents an *individual pitch* rather than a complete plate appearance or official at-bat.
+
+The dataset contains pitch sequencing variables, plate-appearance outcomes, pitch characteristics, pitch location, and batted-ball information. The main analysis uses the sequencing and outcome variables to reconstruct official at-bats and *create a binary hit indicator*.
+
+Because batting average is defined at the official-at-bat level, the raw pitch-level observations cannot be used directly as the unit of analysis.
+The following sections therefore *transform the data* from individual pitches into chronologically ordered plate appearances and official at-bats.
+
+```{r message=FALSE, warning=FALSE}
+
+raw_data <- read_csv("../data/savant_data.csv", show_col_types = FALSE)
+# head(raw_data)
+
+tibble(
+  observations = nrow(raw_data),
+  variables = ncol(raw_data),
+  seasons = paste(
+    sort(unique(raw_data$game_year)),
+    collapse = ", "
+  )
+)
+
+
+```
+
+```{r}
+raw_data %>%
+  select(
+    game_date,
+    game_year,
+    game_pk,
+    at_bat_number,
+    pitch_number,
+    events,
+    description
+  ) %>%
+  slice_head(n = 5)
+```
+
+
+## Chronological Ordering
+
+Because the analysis focuses on sequential batting performance, the ordering of observations must reflect the actual order in which pitches and plate appearances occurred.
+
+The raw Statcast observations were therefore ordered by game date, game identifier, at-bat number, and pitch number. This preserves the within-game and within-plate-appearance sequence required for subsequent
+plate-appearance reconstruction and rolling-window analysis.
+
+```{r}
+pitch_data <- raw_data %>%
+  mutate(game_date = as.Date(game_date,format("%m/%d/%Y")))%>%
+  arrange(game_date, game_pk, at_bat_number, pitch_number)
+
+# head(pitch_data)
+```
+```{r}
+class(raw_data$game_date)
+head(raw_data$game_date,10)
+```
+
+
+## Plate Appearance Reconstruction
+
+first we create the plate appearance identifier:
+
+```{r}
+pitch_data <- pitch_data %>%
+  mutate(
+    pa_id = paste(game_pk, at_bat_number, sep = "_")
+  )
+
+# head(pitch_data)
+```
+
+then we need to define a column means the final pitch result to represent this outcome for this plate Appearance..
+
+```{r}
+pitch_data <- pitch_data %>%
+  group_by(pa_id) %>%
+  mutate(final_pitch=pitch_number==max(pitch_number))%>%
+  ungroup()
+```
+
+now we create a dataset that is based on the PA-level dataset and this only cover the final result for each pa_id, which is count as the current plate Apearance result to define if this is a outs or not.
+
+```{r}
+pa_data <- pitch_data %>%
+  filter(final_pitch) %>%
+  arrange(game_date,game_pk, at_bat_number)
+```
+
+## Official At-Bat Definition
+
+
+Batting average is defined using official at-bats rather than all plate appearances. Therefore, plate appearances that do not count toward the batting-average denominator, such as walks, hit-by-pitches, sacrifice flies,
+and catcher interference, were excluded from the official-at-bat sequence.
+
+Plate appearances resulting in hits, strikeouts, field outs, double plays,
+fielding errors, or fielder's-choice outcomes were classified as official
+at-bats.
+
+This part Our GOAL is: 
+not every hit time is a official at-bat. only the 
+  “single",
+  "double",
+  "triple",
+  "home_run",
+  "field_out",
+  "force_out",
+  "strikeout",
+  "strikeout_double_play",
+  "grounded_into_double_play",
+  "double_play",
+  "triple_play",
+  "field_error",
+  "fielders_choice",
+  "fielders_choice_out"
+  count. The walk, hit-by -pitch, sacrifice fly are not count.
+
+```{r}
+official_ab_events <- c(
+  "single",
+  "double",
+  "triple",
+  "home_run",
+  "field_out",
+  "force_out",
+  "strikeout",
+  "strikeout_double_play",
+  "grounded_into_double_play",
+  "double_play",
+  "triple_play",
+  "field_error",
+  "fielders_choice",
+  "fielders_choice_out"
+)
+
+pa_data <- pa_data %>%
+  mutate(
+    official_at_bat = if_else(
+      events %in% official_ab_events,
+      1L,
+      0L
+    )
+  )
+```
+
+
+SO here we check which kind of event counts as the PA?
+
+```{r}
+pa_data %>%
+  count(events, official_at_bat, sort = TRUE)
+```
+
+
+
+
+## Hit Indicator
+
+define whether it hit or not:
+
+
+
+```{r}
+pa_data <- pa_data %>%
+  mutate(
+    hit = if_else(
+      events %in% c("single", "double", "triple", "home_run"),
+      1L,
+      0L
+    )
+  )
+
+
+```
+
+A binary hit indicator was defined from the terminal plate-appearance
+outcome. Singles, doubles, triples, and home runs were classified as hits
+(`hit = 1`); all other plate-appearance outcomes were assigned `hit = 0`.
+
+The hit indicator alone does not determine whether an observation enters
+the batting-average denominator. Only plate appearances previously
+classified as official at-bats are retained for the primary batting
+analysis.
+
+
+## Official-At-Bat-Level Dataset
+
+The primary analysis dataset was constructed by retaining only plate
+appearances classified as official at-bats. Each row of this dataset
+therefore represents one chronologically ordered official at-bat with a
+binary hit outcome.
+
+This official-at-bat sequence forms the basis for the rolling batting
+average and subsequent Monte Carlo streakiness analysis.
+
+```{r}
+ab_data <- pa_data %>%
+  filter(official_at_bat == 1L) %>%
+  arrange(
+    game_date,
+    game_pk,
+    at_bat_number
+  )
+```
+
+
+# Descriptive Performance Dynamics
+
+## Season-Level Performance
+
+So here in our *ab_data*, we could garantee the one observation line is a official at-bat.
+
+we want ask some basics questions:
+- what is the official AB Michael Harrise II have in each season?
+- How many hits?
+- what is the season batting average?
+
+
+```{r}
+season_summary <- ab_data %>%
+  group_by(game_year) %>%
+  summarise(
+    official_ab = n(),
+    hits = sum(hit),
+    batting_average = mean(hit),
+    .group = "drop"
+  )
+
+season_summary
+```
+
+Season-level batting performance was summarized using the official-at-bat
+sequence constructed above. For each season, the number of official at-bats,
+total hits, and batting average were calculated.
+
+Because the hit indicator is binary, the mean of the hit indicator is
+equivalent to the conventional batting average:
+
+$$
+\widehat{p}_s
+=
+\frac{\sum_{i=1}^{n_s} H_{is}}{n_s}
+=
+\frac{\text{Hits}_s}{\text{Official AB}_s}.
+$$
+
+These season-specific batting averages provide a descriptive baseline and
+later serve as the estimated hit probabilities under the primary Bernoulli
+null model.
+
+## 25-AB Rolling Batting Average
+
+In season s, do we have continuous fluctuation? 
+
+create a variable to record the local performance measure.
+
+here we use the 25 as our window size.
+
+```{r}
+window_size <- 25
+
+ab_data <- ab_data %>%
+  group_by(game_year) %>%
+  arrange(
+    game_date,
+    game_pk,
+    at_bat_number,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    season_ab_number = row_number(),
+    rolling_ba_25 = zoo::rollmean(
+      hit,
+      k = window_size,
+      fill = NA,
+      align = "right"
+    )
+  ) %>%
+  ungroup()
+```
+
+
+## Observed Performance Patterns
+
+
+```{r}
+ggplot(
+  ab_data %>% filter(!is.na(rolling_ba_25)),
+  aes(
+    x = season_ab_number,
+    y = rolling_ba_25
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(
+    ~ game_year,
+    scales = "free_x"
+  ) +
+  labs(
+    title = "25-At-Bat Rolling Batting Average by Season",
+    x = "Official At-Bat Number Within Season",
+    y = "25-AB Rolling Batting Average"
+  ) +
+  theme_minimal()
+```
+
+The 25-at-bat rolling batting-average series show substantial local
+variation within each season, with periods of relatively high and low
+observed performance. The magnitude and persistence of these fluctuations
+also appear to differ across seasons.
+
+However, visible variation in a rolling batting-average series is not, by
+itself, evidence of a hot-hand effect. Even a sequence of independent hit
+outcomes with a constant underlying hit probability can produce apparent
+runs of high and low performance by chance.
+
+The inferential question is therefore whether the observed within-season
+variation is unusually large relative to what would be expected under an
+appropriate no-streakiness null model.
+
+
+
+# Statistical Evidence for Streakiness
+
+## Null Hypothesis
+
+The null model represents a season in which Michael Harris II has a
+constant underlying probability of recording a hit and official
+at-bat outcomes are independent.
+
+For season \(y\), let
+
+\[
+\hat p_y =
+\frac{\text{Hits}_y}
+{\text{Official At-Bats}_y}
+\]
+
+denote the observed season batting average.
+
+Under the null model, simulated official at-bat outcomes are generated as
+
+\[
+H_{i,y}^{sim}
+\overset{iid}{\sim}
+\text{Bernoulli}(\hat p_y).
+\]
+
+Thus, the baseline hit probability is allowed to differ across seasons,
+but remains constant across official at-bats within a season.
+
+The null hypothesis does not imply that the observed sequence should be
+smooth. Independent Bernoulli outcomes can still generate consecutive
+hits, consecutive non-hits, and temporary periods of high or low rolling
+batting average by chance.
+
+The inferential question is therefore whether the observed within-season
+variation in rolling batting average is unusually large relative to the
+variation generated under this independent Bernoulli benchmark.
+
+
+
+## Test Streakiness Statistic
+
+To quantify within-season variation in local batting performance, the
+primary streakiness statistic is defined as the variance of the 25-at-bat
+rolling batting-average series.
+
+For season \(y\), let \(R_{y,t}\) denote the 25-at-bat rolling batting
+average at eligible position \(t\). The observed streakiness statistic is
+
+\[
+T_y^{obs}
+=
+\operatorname{Var}(R_{y,t}).
+\]
+
+Larger values of \(T_y^{obs}\) indicate greater dispersion in local
+batting performance across the season, corresponding to more pronounced
+high and low rolling-performance periods.
+
+The statistic summarizes the magnitude of variation across the full
+rolling batting-average series rather than relying only on a single
+maximum or minimum. However, a large observed variance does not by itself
+establish a hot-hand effect, because substantial rolling variation can
+also arise from random sequences of independent hit outcomes.
+
+Statistical evidence is therefore obtained by comparing the observed
+variance with the distribution of the same statistic generated under the
+season-specific Bernoulli null model.
+
+```{r}
+observed_streakiness <- ab_data %>%
+  filter(!is.na(rolling_ba_25)) %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_variance = var(rolling_ba_25),
+    .groups = "drop"
+  )
+
+observed_streakiness
+```
+
+
+## Monte Carlo Simulation
+
+```{r}
+simulate_streakiness <- function(
+  n_ab,
+  p_hit,
+  window = 25
+) {
+
+  simulated_hits <- rbinom(
+    n = n_ab,
+    size = 1,
+    prob = p_hit
+  )
+
+  simulated_rolling_ba <- zoo::rollmean(
+    simulated_hits,
+    k = window,
+    fill = NA,
+    align = "right"
+  )
+
+  simulated_variance <- var(
+    simulated_rolling_ba,
+    na.rm = TRUE
+  )
+
+  return(simulated_variance)
+}
+```
+
+
+```{r}
+n_sim <- 5000
+
+set.seed(123)
+
+simulation_results <- season_summary %>%
+  select(
+    game_year,
+    official_ab,
+    batting_average
+  ) %>%
+  tidyr::crossing(
+    simulation = seq_len(n_sim)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    simulated_variance = simulate_streakiness(
+      n_ab = official_ab,
+      p_hit = batting_average,
+      window = window_size
+    )
+  ) %>%
+  ungroup()
+```
+
+The sampling distribution of the streakiness statistic under the null
+model is not evaluated analytically. Instead, it is approximated using
+Monte Carlo simulation.
+
+For each season, synthetic official-at-bat sequences are generated from
+
+\[
+H_{i,y}^{*}
+\overset{\mathrm{iid}}{\sim}
+\mathrm{Bernoulli}(\hat p_y),
+\]
+
+while preserving the observed number of official at-bats and the
+season-specific batting average.
+
+For each simulated season, the same 25-at-bat rolling batting-average
+procedure used for the observed data is applied. The variance of the
+resulting rolling series is then calculated,
+
+\[
+T_y^{*}
+=
+\operatorname{Var}(R_{y,t}^{*}).
+\]
+
+This procedure is repeated 5,000 times for each season, producing an
+empirical null distribution of the streakiness statistic. These
+distributions represent the amount of rolling-performance variation that
+would be expected under independent hit outcomes with a constant
+within-season hit probability.
+
+## Monte Carlo P-Values
+
+```{r}
+monte_carlo_results <- simulation_results %>%
+  left_join(
+    observed_streakiness,
+    by = "game_year"
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_variance = first(observed_variance),
+
+    exceedances = sum(
+      simulated_variance >= observed_variance
+    ),
+
+    n_simulations = n(),
+
+    monte_carlo_p = (
+      exceedances + 1
+    ) / (
+      n_simulations + 1
+    ),
+
+    .groups = "drop"
+  )
+
+monte_carlo_results
+```
+
+For each season, the observed streakiness statistic was compared with its
+Monte Carlo null distribution. Because larger rolling-variance values
+represent greater within-season performance fluctuation, evidence against
+the null model is assessed in the upper tail of the simulated distribution.
+
+The Monte Carlo p-value is calculated as
+
+\[
+p_{\mathrm{MC}}
+=
+\frac{
+1+\sum_{b=1}^{B}
+I(T_{y,b}^{*}\geq T_y^{obs})
+}{
+B+1
+},
+\]
+
+where \(B=5{,}000\) is the number of simulated seasons and
+\(T_{y,b}^{*}\) is the simulated streakiness statistic from Monte Carlo
+replication \(b\).
+
+The finite-simulation correction prevents a p-value of exactly zero when
+none of the simulated statistics is as large as the observed statistic.
+
+Small Monte Carlo p-values indicate that the observed rolling-performance
+variation is unusual relative to the season-specific i.i.d. Bernoulli
+null model. They should not be interpreted as the probability that the
+null hypothesis is true or as direct proof of a causal hot-hand mechanism.
+
+
+
+## Null-Envelope Visualization
+
+to see which part of the data is the extreme place?
+
+```{r}
+null_cutoffs <- simulation_results %>%
+  group_by(game_year) %>%
+  summarise(
+    null_95 = quantile(
+      simulated_variance,
+      probs = 0.95
+    ),
+    .groups = "drop"
+  )
+
+null_cutoffs
+```
+
+```{r}
+null_plot_data <- null_cutoffs %>%
+  left_join(
+    observed_streakiness,
+    by = "game_year"
+  )
+
+null_plot_data
+```
+
+```{r}
+ggplot(
+  simulation_results,
+  aes(x = simulated_variance)
+) +
+  geom_histogram(
+    bins = 40
+  ) +
+  geom_vline(
+    data = null_plot_data,
+    aes(xintercept = null_95),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  geom_vline(
+    data = null_plot_data,
+    aes(xintercept = observed_variance),
+    inherit.aes = FALSE,
+    linewidth = 1
+  ) +
+  facet_wrap(
+    ~ game_year,
+    scales = "free"
+  ) +
+  labs(
+    title = "Observed Streakiness Relative to the Monte Carlo Null Distribution",
+    subtitle = "Solid line = observed variance; dashed line = 95th percentile of the null distribution",
+    x = "Variance of 25-AB Rolling Batting Average",
+    y = "Number of Simulated Seasons"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(
+  simulation_results,
+  aes(x = simulated_variance)
+) +
+  geom_rect(
+    data = null_plot_data,
+    aes(
+      xmin = null_95,
+      xmax = Inf,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "#FEE0D2",
+    alpha = 0.45
+  ) +
+  geom_histogram(
+    bins = 40,
+    fill = "#6BAED6",
+    color = "white",
+    alpha = 0.8
+  ) +
+  geom_vline(
+    data = null_plot_data,
+    aes(xintercept = null_95),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.8,
+    color = "#636363"
+  ) +
+  geom_vline(
+    data = null_plot_data,
+    aes(xintercept = observed_variance),
+    inherit.aes = FALSE,
+    linewidth = 1,
+    color = "#CB181D"
+  ) +
+  facet_wrap(
+    ~ game_year,
+    scales = "free"
+  ) +
+  labs(
+    title = "Observed Streakiness Relative to the Monte Carlo Null Distribution",
+    subtitle = "Red line = observed variance; dashed line = 95th percentile; shaded region = upper 5% of null distribution",
+    x = "Variance of 25-AB Rolling Batting Average",
+    y = "Number of Simulated Seasons"
+  ) +
+  theme_minimal()
+```
+
+The Monte Carlo null distributions provide a visual benchmark for the
+amount of rolling-performance variation expected under independent
+Bernoulli outcomes.
+
+The 2022 observed statistic lies well within its null distribution, while
+the 2023 statistic is farther into the upper tail but remains below the
+95th-percentile cutoff. The 2024 observed variance lies close to the
+upper-tail threshold, consistent with suggestive but not conventionally
+significant evidence of elevated variation.
+
+The strongest departure occurs in 2025. The observed rolling-BA variance
+lies beyond the 95th-percentile cutoff and exceeds all 5,000 simulated
+null statistics. This is consistent with the corrected Monte Carlo
+p-value of approximately 0.0002.
+
+These comparisons indicate that the magnitude of rolling-performance
+variation in 2025 is highly unusual relative to the specified
+season-specific i.i.d. Bernoulli null model. They do not, by themselves,
+identify the mechanism responsible for that departure.
+
+## Pointwise Null Envelope
+
+
+```{r}
+# simulated rolling path
+
+simulate_rolling_path <- function(
+  n_ab,
+  p_hit,
+  window = 25
+) {
+
+  simulated_hits <- rbinom(
+    n = n_ab,
+    size = 1,
+    prob = p_hit
+  )
+
+  simulated_rolling_ba <- zoo::rollmean(
+    simulated_hits,
+    k = window,
+    fill = NA,
+    align = "right"
+  )
+
+  tibble(
+    season_ab_number = seq_len(n_ab),
+    simulated_rolling_ba = simulated_rolling_ba
+  )
+}
+```
+
+```{r}
+# generate simulations
+
+set.seed(123)
+
+rolling_simulations <- season_summary %>%
+  select(
+    game_year,
+    official_ab,
+    batting_average
+  ) %>%
+  tidyr::crossing(
+    simulation = seq_len(n_sim)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    rolling_path = list(
+      simulate_rolling_path(
+        n_ab = official_ab,
+        p_hit = batting_average,
+        window = window_size
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  select(
+    game_year,
+    simulation,
+    rolling_path
+  ) %>%
+  tidyr::unnest(rolling_path)
+```
+
+
+```{r}
+null_envelope <- rolling_simulations %>%
+  filter(!is.na(simulated_rolling_ba)) %>%
+  group_by(
+    game_year,
+    season_ab_number
+  ) %>%
+  summarise(
+    lower_95 = quantile(
+      simulated_rolling_ba,
+      probs = 0.025
+    ),
+    upper_95 = quantile(
+      simulated_rolling_ba,
+      probs = 0.975
+    ),
+    .groups = "drop"
+  )
+```
+
+```{r}
+envelope_plot_data <- ab_data %>%
+  filter(!is.na(rolling_ba_25)) %>%
+  select(
+    game_year,
+    season_ab_number,
+    rolling_ba_25
+  ) %>%
+  left_join(
+    null_envelope,
+    by = c(
+      "game_year",
+      "season_ab_number"
+    )
+  )
+```
+
+```{r}
+ggplot(
+  envelope_plot_data,
+  aes(
+    x = season_ab_number,
+    y = rolling_ba_25
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = lower_95,
+      ymax = upper_95
+    ),
+    alpha = 0.25
+  ) +
+  geom_line(
+    linewidth = 0.8
+  ) +
+  facet_wrap(
+    ~ game_year,
+    scales = "free_x"
+  ) +
+  labs(
+    title = "Observed 25-AB Rolling Batting Average vs. Null Envelope",
+    subtitle = "Shaded region = pointwise 95% Monte Carlo null envelope",
+    x = "Official At-Bat Number Within Season",
+    y = "25-AB Rolling Batting Average"
+  ) +
+  theme_minimal()
+```
+
+To visualize where the observed rolling batting-average trajectory differs
+from patterns commonly generated under the null model, pointwise Monte
+Carlo envelopes were constructed.
+
+For each season and each eligible official-at-bat position, the 2.5th and
+97.5th percentiles of the simulated 25-at-bat rolling batting averages
+were calculated. These quantiles form a pointwise 95% null envelope around
+the rolling-performance trajectories expected under the season-specific
+i.i.d. Bernoulli model.
+
+Observed values outside the envelope identify local periods that appear
+unusual relative to the null benchmark. However, the envelope is
+pointwise rather than simultaneous. Because many positions are examined
+within each season, an individual crossing should not be interpreted as
+a standalone 5% significance test.
+
+Formal season-level inference therefore remains based on the Monte Carlo
+variance statistic and its corresponding p-value. The pointwise envelope
+is used primarily to visualize and localize the performance patterns
+underlying the season-level results.
+
+## Year-by-Year Results
+
+The Monte Carlo analysis reveals substantial differences in the magnitude
+of within-season rolling-performance variation across seasons.
+
+In 2022, the observed rolling-BA variance was well within the range
+expected under the season-specific Bernoulli null model
+(\(p_{\mathrm{MC}} = 0.634\)). Thus, the observed variation provides
+little evidence of a departure from the independent, constant-probability
+benchmark.
+
+The 2023 season exhibited greater rolling-performance variation, but the
+observed statistic remained compatible with the null distribution
+(\(p_{\mathrm{MC}} = 0.138\)).
+
+The 2024 observed variance was farther into the upper tail of its null
+distribution (\(p_{\mathrm{MC}} = 0.089\)). This provides suggestive
+evidence of elevated within-season variation, although the result does not
+cross the conventional 0.05 threshold.
+
+The strongest departure occurred in 2025. None of the 5,000 simulated
+seasons produced a rolling-BA variance as large as the observed value.
+After applying the finite-simulation correction, the Monte Carlo p-value
+was approximately \(0.0002\). The magnitude of the observed 2025
+rolling-performance variation was therefore highly unusual relative to
+the specified season-specific i.i.d. Bernoulli null model.
+
+These results provide evidence about departures from the specified
+no-streakiness benchmark rather than establishing a causal hot-hand
+mechanism. Time-varying opponent quality, pitcher matchups, injuries,
+platoon effects, and other contextual factors could also generate
+departures from a constant-probability Bernoulli model.
+
+
+Because four season-specific tests were conducted, Holm-adjusted p-values
+were also examined as a multiple-testing sensitivity check.
+```{r}
+monte_carlo_results <- monte_carlo_results %>%
+  mutate(
+    holm_p = p.adjust(
+      monte_carlo_p,
+      method = "holm"
+    )
+  )
+
+monte_carlo_results
+```
+
+
+
+# Main Findings
+
+The analysis yields three main findings.
+
+First, Michael Harris II's 25-at-bat rolling batting average exhibits
+substantial local variation across all four seasons. Periods of relatively
+high and low observed performance are therefore visible in the raw
+performance trajectories, although such patterns can also arise from
+random sequences of independent hit outcomes.
+
+Second, the magnitude of this variation differs substantially across
+seasons when compared with season-specific Monte Carlo null distributions.
+The 2022 and 2023 observed statistics were compatible with the independent
+Bernoulli benchmark, while the 2024 statistic was farther into the upper
+tail of its null distribution (\(p_{\mathrm{MC}} = 0.089\)).
+
+Third, the strongest departure occurred in 2025. None of the 5,000
+simulated null seasons produced a 25-at-bat rolling-BA variance as large
+as the observed value, yielding a finite-simulation-corrected Monte Carlo
+p-value of approximately \(0.0002\).
+
+Taken together, the results indicate that the 2025 batting sequence
+contained substantially more rolling-performance variation than expected
+under the specified season-specific i.i.d. Bernoulli model. This finding
+identifies an unusually variable performance pattern, but does not by
+itself establish a causal hot-hand mechanism.
+
+
+# Limitations
+
+The analysis should be interpreted relative to the assumptions of the
+specified null model.
+
+First, the season-specific i.i.d. Bernoulli model assumes that the
+underlying hit probability remains constant within each season and that
+official at-bat outcomes are independent. Real batting opportunities vary
+with pitcher quality, handedness, game environment, injuries, and other
+contextual factors. Consequently, rejection of this simplified null model
+does not uniquely identify a hot-hand mechanism.
+
+Second, the season-level hit probability is unknown and is replaced by the
+observed batting average. The Monte Carlo distributions therefore
+condition on an estimated season-specific probability rather than
+propagating uncertainty in that parameter.
+
+Third, the primary analysis depends on a 25-at-bat rolling window and on
+rolling-BA variance as the streakiness statistic. The window length is an
+analytical choice, and variance measures the magnitude of local performance
+variation rather than temporal persistence directly. Alternative window
+lengths and streakiness statistics should therefore be examined as
+robustness checks.
+
+Fourth, adjacent rolling batting averages share most of their underlying
+at-bats and are consequently highly dependent. The Monte Carlo procedure
+reproduces this overlapping-window structure in every simulated season,
+but individual rolling observations should not be interpreted as
+independent measurements.
+
+Finally, the 95% rolling-BA null envelopes are pointwise rather than
+simultaneous. Individual crossings are therefore descriptive indicators
+of locally unusual performance rather than standalone significance tests.
+
+More broadly, the analysis is observational. It identifies departures
+from a specified no-streakiness statistical benchmark but does not
+estimate a randomized or causal effect of being in a "hot" state.
+
+# Conclusion
+
+This study examined whether Michael Harris II's within-season batting
+performance exhibited more temporal variation than would be expected under
+a season-specific no-streakiness benchmark. Pitch-level Statcast data from
+2022 through 2025 were reconstructed into official at-bats, represented as
+binary hit outcomes, and summarized using 25-at-bat rolling batting
+averages. The variance of each season's rolling series was then compared
+with empirical null distributions generated from 5,000 season-specific
+Bernoulli simulations.
+
+The strength of evidence differed substantially across seasons. The 2022
+and 2023 performance trajectories were broadly compatible with the
+independent Bernoulli benchmark, while 2024 showed suggestive evidence of
+elevated rolling-performance variation. The strongest departure occurred
+in 2025: none of the 5,000 simulated null seasons produced a rolling-BA
+variance as large as the observed value, corresponding to a
+finite-simulation-corrected Monte Carlo p-value of approximately 0.0002.
+
+These findings indicate that Harris's 2025 batting sequence contained
+substantially more local performance variation than expected under the
+specified season-specific i.i.d. Bernoulli model. They do not, however,
+establish that the variation was generated by a causal or persistent
+hot-hand mechanism. Robustness analyses and baseball-context analyses are
+therefore needed to determine whether the result persists under alternative
+statistical specifications and whether changes in pitching environment,
+swing decisions, contact quality, or other observable factors coincide
+with the unusual performance periods.

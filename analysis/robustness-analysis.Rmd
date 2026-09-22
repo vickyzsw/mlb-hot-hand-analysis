@@ -1,0 +1,1466 @@
+---
+title: "Robustness Analysis: MLB Hot-Hand Effect"
+author: "Shenwei Zhang"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(zoo)
+```
+
+
+# Purpose
+
+The primary analysis identified unusually large within-season variation
+in Michael Harris II's 2025 batting performance relative to a
+season-specific i.i.d. Bernoulli null model. That analysis used a
+25-at-bat rolling batting average and the variance of the rolling series
+as the primary streakiness statistic.
+
+These choices define one reasonable statistical specification, but they
+are not unique. The purpose of this robustness analysis is therefore to
+evaluate whether the substantive findings persist under alternative
+reasonable analytical choices.
+
+The analysis focuses on three sources of specification sensitivity:
+
+1. the length of the rolling batting-average window;
+2. the statistic used to quantify temporal variation or dependence; and
+3. the assumptions used to construct the no-streakiness benchmark.
+
+The goal is not to search across specifications for statistically
+significant results. Instead, the alternative specifications are used as
+sensitivity checks for conclusions established in the primary analysis.
+
+# Reconstruct Analysis Data
+
+```{r}
+raw_data <- readr::read_csv(
+  "../data/savant_data.csv",
+  show_col_types = FALSE
+)
+
+```
+
+
+## Load Statcast Data
+
+```{r}
+source("../data/prepare_analysis_data.R")
+
+dim(ab_data)
+```
+
+
+## Construct Official At-Bat Dataset
+
+```{r}
+ab_data %>%
+  group_by(game_year) %>%
+  summarise(
+    official_ab = n(),
+    hits = sum(hit),
+    batting_average = mean(hit),
+    .groups = "drop"
+  )
+```
+
+# Rolling-Window Sensitivity
+
+
+
+## Alternative Window Lengths
+
+The primary analysis uses a 25-at-bat rolling window to summarize local
+batting performance. Because the choice of window length determines the
+time scale over which performance variation is measured, the analysis is
+repeated using several alternative window lengths.
+
+The sensitivity analysis considers windows of 10, 15, 25, and 30 official
+at-bats:
+
+\[
+w \in \{10, 15, 25, 30\}.
+\]
+
+```{r}
+window_sizes <- c(10, 15, 25, 30)
+
+window_sizes
+```
+
+
+The 25-at-bat window remains the primary specification. The alternative
+windows are used only to evaluate whether the substantive conclusions are
+sensitive to the chosen smoothing scale.
+
+
+
+## Observed Rolling Patterns
+
+
+For each window length, rolling batting average is recalculated separately
+within each season. Streakiness is measured using the same statistic as
+the primary analysis: the variance of the rolling batting-average series,
+
+\[
+T_y(w) = \operatorname{Var}\left(R_{y,t}^{(w)}\right).
+\]
+
+Keeping the statistic fixed while changing only the window length allows
+the sensitivity of the observed variation to the smoothing choice to be
+evaluated directly.
+
+
+```{r}
+calculate_observed_streakiness <- function(
+  data,
+  window
+) {
+
+  data %>%
+    group_by(game_year) %>%
+    arrange(
+      game_date,
+      game_pk,
+      at_bat_number,
+      .by_group = TRUE
+    ) %>%
+    mutate(
+      rolling_ba = zoo::rollmean(
+        hit,
+        k = window,
+        fill = NA,
+        align = "right"
+      )
+    ) %>%
+    summarise(
+      observed_variance = var(
+        rolling_ba,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      window = window
+    )
+}
+```
+
+
+
+
+
+
+```{r}
+observed_window_results <- bind_rows(
+  lapply(
+    window_sizes,
+    function(w) {
+      calculate_observed_streakiness(
+        data = ab_data,
+        window = w
+      )
+    }
+  )
+)
+
+observed_window_results
+```
+
+Observed rolling-BA variance changes with the window length, as expected
+because shorter windows are more responsive to local fluctuations while
+longer windows smooth the performance series.
+
+Across the specifications, 2025 consistently shows relatively large
+observed variation. However, raw variances are not directly comparable
+across window lengths because each window produces a different scale of
+natural variability. Statistical interpretation therefore requires a
+separate Monte Carlo null distribution for each season-window combination.
+
+## Monte Carlo Tests Across Windows
+
+**For each window, is the observed variance unusually large relative to what that same window would produce under the Bernoulli null?**
+
+### create the simulation function
+
+Raw rolling-BA variances are not directly comparable across window lengths.
+Therefore, a separate Monte Carlo null distribution is constructed for
+each season-window combination.
+
+For each simulation, a season-length sequence of independent Bernoulli
+outcomes is generated using the observed season batting average. The same
+rolling window and variance statistic are then applied to the simulated
+sequence, ensuring that each observed statistic is compared with an
+appropriate null benchmark.
+
+```{r}
+simulate_streakiness <- function(
+  n_ab,
+  p_hit,
+  window
+) {
+
+  simulated_hits <- rbinom(
+    n = n_ab,
+    size = 1,
+    prob = p_hit
+  )
+
+  simulated_rolling_ba <- zoo::rollmean(
+    simulated_hits,
+    k = window,
+    fill = NA,
+    align = "right"
+  )
+
+  var(
+    simulated_rolling_ba,
+    na.rm = TRUE
+  )
+}
+```
+
+### prepare the simulation parameters for each season
+
+Each simulated season preserves the observed number of official at-bats \(n_y\) and season batting average \(\hat p_y\). Hit outcomes are then independently generated from \(\text{Bernoulli}(\hat p_y)\), preserving the season's baseline performance while removing the observed temporal structure.
+
+```{r}
+season_summary <- ab_data %>%
+  group_by(game_year) %>%
+  summarise(
+    official_ab = n(),
+    hits = sum(hit),
+    batting_average = mean(hit),
+    .groups = "drop"
+  )
+
+# season_summary (same as the mainanalysis infor about this)
+# since we only change the window size not the other
+```
+
+### Generate Monte Carlo Simulations
+
+now this part code create all th combinations: 
+$$4 seasons×4 windows×5000 simulations=80,000$$
+
+For each season-window combination, 5,000 Monte Carlo seasons are
+generated under the season-specific Bernoulli null model.
+
+The observed and simulated sequences are analyzed using the same rolling window and variance statistic. The observed statistic \(T_y^{obs}(w)\) is then compared with the simulated null statistics \(T_y^*(w)\) to determine whether the observed variation is unusually large under the no-streakiness benchmark.
+
+```{r}
+n_sim <- 5000
+
+set.seed(123)
+
+window_simulations <- tidyr::crossing(
+  season_summary,
+  window = window_sizes,
+  simulation = seq_len(n_sim)
+) %>%
+  rowwise() %>%
+  mutate(
+    simulated_variance = simulate_streakiness(
+      n_ab = official_ab,
+      p_hit = batting_average,
+      window = window
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+dim(window_simulations)
+# check the simaltion numbers?
+```
+
+## Window-Sensitivity Results
+
+For each season-window combination, the observed rolling-BA variance is
+compared with its corresponding Monte Carlo null distribution. The
+Monte Carlo p-value is the proportion of simulated statistics at least as
+large as the observed statistic, using the finite-simulation correction:
+
+\[
+p_{\mathrm{MC}}
+=
+\frac{1+\sum_{b=1}^{B} I(T_{y,b}^{*}(w)\geq T_y^{obs}(w))}
+{B+1}.
+\]
+
+### calculate the 16-values
+
+```{r}
+window_robustness_results <- window_simulations %>%
+  left_join(
+    observed_window_results,
+    by = c("game_year", "window")
+  ) %>%
+  group_by(
+    game_year,
+    window
+  ) %>%
+  summarise(
+    observed_variance = first(observed_variance),
+    exceedances = sum(
+      simulated_variance >= observed_variance
+    ),
+    n_simulations = n(),
+    monte_carlo_p = (
+      exceedances + 1
+    ) / (
+      n_simulations + 1
+    ),
+    .groups = "drop"
+  )
+
+window_robustness_results
+```
+
+The 2025 result is robust to the choice of rolling-window length. Across
+10-, 15-, 25-, and 30-at-bat windows, the observed rolling-BA variance
+remains in the extreme upper tail of its corresponding Monte Carlo null
+distribution, with Monte Carlo p-values ranging from approximately
+0.0002 to 0.0010.
+
+In contrast, the 2022–2024 results are substantially less extreme across
+the tested window lengths. Thus, the unusually large 2025 variation is
+not driven specifically by the primary 25-at-bat window choice.
+
+### visualize window sensitivity
+
+```{r}
+ggplot(
+  window_robustness_results,
+  aes(
+    x = window,
+    y = monte_carlo_p,
+    group = factor(game_year),
+    linetype = factor(game_year),
+    shape = factor(game_year)
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.5) +
+  geom_hline(
+    yintercept = 0.05,
+    linetype = "dashed"
+  ) +
+  scale_x_continuous(
+    breaks = window_sizes
+  ) +
+  labs(
+    title = "Monte Carlo P-Values Across Rolling-Window Lengths",
+    subtitle = "Dashed horizontal line indicates p = 0.05",
+    x = "Rolling Window Length (Official At-Bats)",
+    y = "Monte Carlo P-Value",
+    linetype = "Season",
+    shape = "Season"
+  ) +
+  theme_minimal()
+```
+
+The window-sensitivity analysis shows a clear difference across seasons.
+The 2022 results remain well within the range expected under the null
+model, while the 2023 and 2024 results move closer to the upper tail as
+the window length changes but remain above the 0.05 reference level.
+
+In contrast, the 2025 Monte Carlo p-values remain approximately 0.001 or
+smaller across all four window lengths. They appear nearly flat at zero
+in the figure because the y-axis extends to approximately 0.8, not because
+the p-values are actually zero.
+
+Overall, the unusually large rolling-performance variation observed in
+2025 is robust to the choice of 10-, 15-, 25-, or 30-at-bat windows and
+is therefore not specific to the primary 25-AB specification.
+
+
+# Alternative Streakiness Statistics
+
+**Does the 2025 result persist when streakiness is measured in a different way?**
+
+## Why Variance May Be Insufficient
+
+The primary analysis measures streakiness using the variance of the
+rolling batting-average series. This captures the overall magnitude of
+local performance fluctuations, but it does not directly measure how
+batting outcomes are ordered over time.
+
+Two seasons can have similar rolling-BA variance while exhibiting
+different temporal patterns. Therefore, alternative statistics are used
+to test whether the 2025 finding also appears when streakiness is defined
+through temporal dependence rather than only the magnitude of rolling
+variation.
+
+
+## Alternative Statistics 1： Lag-1 Autocorrelation
+
+As an alternative to rolling-BA variance, lag-1 autocorrelation measures
+whether consecutive official at-bat outcomes are temporally related.
+
+For the binary hit sequence \(H_1,\ldots,H_n\), the statistic is
+
+\[
+T_{\text{ACF}}
+=
+\operatorname{Cor}(H_t,H_{t-1}).
+\]
+
+Positive values indicate that similar outcomes tend to occur consecutively,
+while values near zero indicate little linear dependence between adjacent
+at-bats. This provides a complementary measure of streakiness that focuses
+on temporal ordering rather than the magnitude of rolling-BA variation.
+
+### observed lag-1 auto correlation
+
+```{r}
+calculate_lag1 <- function(data) {
+
+  data %>%
+    group_by(game_year) %>%
+    arrange(
+      game_date,
+      game_pk,
+      at_bat_number,
+      .by_group = TRUE
+    ) %>%
+    summarise(
+      observed_lag1 = cor(
+        hit[-1],
+        hit[-length(hit)]
+      ),
+      .groups = "drop"
+    )
+}
+```
+
+```{r}
+observed_lag1_results <- calculate_lag1(ab_data)
+
+observed_lag1_results
+```
+### monte carlo null distribution for lag-1
+
+**Does the observed lag-1 correlation in 2025 count as the unusually large?**
+
+To isolate sensitivity to the choice of streakiness statistic, the
+season-specific i.i.d. Bernoulli null model is kept unchanged from the
+primary analysis.
+
+For each simulated season,
+
+\[
+H_{i,y}^{*}
+\overset{iid}{\sim}
+\operatorname{Bernoulli}(\hat p_y),
+\]
+
+where the observed number of official at-bats and season batting average
+are preserved. Lag-1 autocorrelation is then calculated for each simulated
+hit sequence and compared with the observed statistic.
+
+```{r}
+simulate_lag1 <- function(
+  n_ab,
+  p_hit
+) {
+
+  simulated_hits <- rbinom(
+    n = n_ab,
+    size = 1,
+    prob = p_hit
+  )
+
+  cor(
+    simulated_hits[-1],
+    simulated_hits[-length(simulated_hits)]
+  )
+}
+```
+
+### Monte Carlo Simulation for Lag-1 Autocorrelation
+
+For each season, 5,000 independent hit sequences are generated under the
+season-specific Bernoulli null model. Each simulated season preserves the
+observed number of official at-bats and batting average.
+
+$$
+4 seasons * 5000 simulations = 20000
+$$
+
+Lag-1 autocorrelation is calculated for every simulated sequence, producing
+a null distribution that represents the amount of adjacent dependence that
+could arise by chance under independent batting outcomes.
+
+```{r}
+set.seed(123)
+
+lag1_simulations <- tidyr::crossing(
+  season_summary,
+  simulation = seq_len(n_sim)
+) %>%
+  rowwise() %>%
+  mutate(
+    simulated_lag1 = simulate_lag1(
+      n_ab = official_ab,
+      p_hit = batting_average
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# check it
+dim(lag1_simulations)
+lag1_simulations %>%
+  count(game_year)
+```
+
+### Monte Carlo Results
+
+For each season, the observed lag-1 autocorrelation is compared with the
+distribution of lag-1 autocorrelations generated under the i.i.d.
+Bernoulli null model.
+
+Because the hot-hand hypothesis corresponds to positive temporal
+dependence, the upper-tail Monte Carlo p-value is
+
+\[
+p_{\mathrm{MC}}
+=
+\frac{
+1+\sum_{b=1}^{B}
+I(T_{\mathrm{ACF},b}^{*}\geq T_{\mathrm{ACF}}^{obs})
+}{
+B+1
+}.
+\]
+
+A small p-value indicates that the observed positive lag-1 dependence
+would be unusual under independent batting outcomes.
+
+```{r}
+lag1_results <- lag1_simulations %>%
+  left_join(
+    observed_lag1_results,
+    by = "game_year"
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_lag1 = first(observed_lag1),
+
+    exceedances = sum(
+      simulated_lag1 >= observed_lag1
+    ),
+
+    n_simulations = n(),
+
+    monte_carlo_p = (
+      exceedances + 1
+    ) / (
+      n_simulations + 1
+    ),
+
+    .groups = "drop"
+  )
+
+lag1_results
+```
+Lag-1 autocorrelation produces a different pattern from the rolling-variance
+statistic. The 2025 season has a positive observed lag-1 correlation
+(\(r = 0.045\)), but the corresponding Monte Carlo p-value is approximately
+0.124. Thus, the unusually large rolling-performance variation identified
+for 2025 does not appear to be driven by unusually strong immediate
+at-bat-to-at-bat dependence.
+
+In contrast, 2023 exhibits the largest observed lag-1 autocorrelation
+(\(r = 0.097\)) and a relatively small upper-tail Monte Carlo p-value
+(\(p \approx 0.012\)). This illustrates that different streakiness
+statistics capture different aspects of temporal structure: rolling
+variance measures the magnitude of local performance fluctuations,
+whereas lag-1 autocorrelation measures dependence between consecutive
+at-bat outcomes.
+
+## Alternative Statistic 2 — Longest Hit Run
+
+As a second alternative measure, the longest hit run captures the maximum
+number of consecutive official at-bats resulting in hits within a season.
+
+\[
+T_{\text{run}}
+=
+\max\{\text{length of consecutive hit sequences}\}.
+\]
+
+Unlike rolling-BA variance, which measures the magnitude of local
+performance fluctuations, and lag-1 autocorrelation, which measures
+average dependence between adjacent outcomes, the longest-run statistic
+focuses on extreme clustering of consecutive hits.
+
+```{r}
+# define the statistic
+calculate_longest_hit_run <- function(hit_sequence) {
+
+  runs <- rle(hit_sequence)
+
+  max(
+    runs$lengths[runs$values == 1]
+  )
+}
+```
+
+```{r}
+# use it in the real 2022-2025 data
+observed_run_results <- ab_data %>%
+  group_by(game_year) %>%
+  arrange(
+    game_date,
+    game_pk,
+    at_bat_number,
+    .by_group = TRUE
+  ) %>%
+  summarise(
+    observed_longest_run =
+      calculate_longest_hit_run(hit),
+    .groups = "drop"
+  )
+
+observed_run_results
+```
+
+### Monte Carlo simulate longest hit runs
+
+The observed longest hit run increases from four consecutive hits in 2022
+to six in 2025. However, the raw run length alone does not indicate
+whether such clustering is unusual, because seasons differ in both the
+number of official at-bats and baseline batting average.
+
+Therefore, the observed longest run is compared with season-specific
+Monte Carlo null distributions generated under the same i.i.d. Bernoulli
+model used in the primary analysis.
+
+```{r}
+simulate_longest_hit_run <- function(
+  n_ab,
+  p_hit
+) {
+
+  simulated_hits <- rbinom(
+    n = n_ab,
+    size = 1,
+    prob = p_hit
+  )
+
+  calculate_longest_hit_run(
+    simulated_hits
+  )
+}
+```
+
+
+$$
+4 sesons * 5000 = 20000
+$$
+
+```{r}
+set.seed(123)
+
+run_simulations <- tidyr::crossing(
+  season_summary,
+  simulation = seq_len(n_sim)
+) %>%
+  rowwise() %>%
+  mutate(
+    simulated_longest_run =
+      simulate_longest_hit_run(
+        n_ab = official_ab,
+        p_hit = batting_average
+      )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+run_simulations %>%
+  count(game_year)
+```
+
+### Monte Carlo Results for Longest Hit Run
+
+For each season, the observed longest hit run is compared with the
+distribution of longest runs generated under the i.i.d. Bernoulli null
+model.
+
+The upper-tail Monte Carlo p-value is
+
+\[
+p_{\mathrm{MC}}
+=
+\frac{
+1+\sum_{b=1}^{B}
+I(T_{\mathrm{run},b}^{*}\geq T_{\mathrm{run}}^{obs})
+}{
+B+1
+}.
+\]
+
+A small p-value indicates that a hit run at least as long as the observed
+run would be unusual under independent batting outcomes.
+
+```{r}
+run_results <- run_simulations %>%
+  left_join(
+    observed_run_results,
+    by = "game_year"
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_longest_run =
+      first(observed_longest_run),
+
+    exceedances = sum(
+      simulated_longest_run >=
+        observed_longest_run
+    ),
+
+    n_simulations = n(),
+
+    monte_carlo_p = (
+      exceedances + 1
+    ) / (
+      n_simulations + 1
+    ),
+
+    .groups = "drop"
+  )
+
+run_results
+```
+### Summary
+
+The longest-hit-run statistic provides weaker evidence of unusual
+consecutive-hit clustering than the primary rolling-variance analysis.
+The longest observed run increased from four hits in 2022 to six hits in
+2025, but a run of at least six hits occurred in 498 of the 5,000
+simulated 2025 seasons, corresponding to a Monte Carlo p-value of
+approximately 0.100.
+
+Together with the lag-1 autocorrelation results, this suggests that the
+strong 2025 rolling-variance result is not explained simply by unusually
+strong immediate hit-to-hit dependence or by a single exceptionally long
+run of consecutive hits. Instead, the evidence appears more consistent
+with unusual variation in performance over a broader time scale.
+
+# Null-Model Sensitivity
+
+## Limitations of Constant-p Bernoulli Null
+
+The primary analysis uses a season-specific i.i.d. Bernoulli null model,
+
+\[
+H_{i,y}^{*}
+\overset{iid}{\sim}
+\operatorname{Bernoulli}(\hat p_y),
+\]
+
+which assumes that every official at-bat within a season has the same hit
+probability and that outcomes are independent over time.
+
+This provides a transparent benchmark for no temporal structure, but it
+simplifies the actual baseball data-generating process. In observational
+game data, the probability of a hit may vary across at-bats because of
+changing game contexts, opponents, pitch characteristics, and other
+observed or unobserved factors.
+
+Therefore, an unusually large statistic relative to the i.i.d. Bernoulli
+null establishes that the observed temporal pattern is inconsistent with
+this particular constant-probability benchmark. It does not, by itself,
+identify a causal hot-hand effect.
+
+The following sensitivity analyses therefore consider alternative null
+models that preserve more structure from the observed data while removing
+the specific temporal ordering associated with streakiness.
+
+## Alternative Benchmarks
+
+### Within-Season Permutation Null
+
+As an alternative to the i.i.d. Bernoulli benchmark, a within-season
+permutation null preserves the exact observed hit and non-hit outcomes
+within each season while randomly reordering their temporal positions.
+
+For season \(y\), each permutation therefore preserves the number of
+official at-bats and the total number of hits exactly, but removes the
+observed ordering of those outcomes.
+
+This null asks whether the observed rolling-performance variation is
+unusual conditional on the season's realized outcomes, rather than
+relative to newly generated Bernoulli outcomes. The permutation procedure
+is used as a statistical null benchmark and should not be interpreted as
+a randomized experimental assignment mechanism.
+
+```{r}
+simulate_permutation_variance <- function(
+  hit_sequence,
+  window = 25
+) {
+
+  permuted_hits <- sample(
+    hit_sequence,
+    size = length(hit_sequence),
+    replace = FALSE
+  )
+
+  permuted_rolling_ba <- zoo::rollmean(
+    permuted_hits,
+    k = window,
+    fill = NA,
+    align = "right"
+  )
+
+  var(
+    permuted_rolling_ba,
+    na.rm = TRUE
+  )
+}
+
+```
+
+#### prepare the observed hit sequences
+
+```{r}
+season_sequences <- ab_data %>%
+  arrange(
+    game_year,
+    game_date,
+    game_pk,
+    at_bat_number
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    hit_sequence = list(hit),
+    .groups = "drop"
+  )
+
+season_sequences
+```
+
+#### Generate 5000 permutations per season
+
+For each season, the observed hit sequence is randomly permuted 5,000
+times. Each permutation preserves the exact number of hits and non-hits
+but changes their temporal ordering.
+
+For every permuted sequence, the primary 25-at-bat rolling batting
+average and its variance are recalculated. This produces a
+season-specific permutation null distribution for the primary
+streakiness statistic.
+
+```{r}
+set.seed(123)
+
+permutation_simulations <- tidyr::crossing(
+  season_sequences,
+  simulation = seq_len(n_sim)
+) %>%
+  rowwise() %>%
+  mutate(
+    permuted_variance =
+      simulate_permutation_variance(
+        hit_sequence = hit_sequence,
+        window = 25
+      )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# check it
+permutation_simulations %>%
+  count(game_year)
+
+test_sequence <- season_sequences %>%
+  filter(game_year == 2025) %>%
+  pull(hit_sequence) %>%
+  .[[1]]
+
+test_permutation <- sample(
+  test_sequence,
+  replace = FALSE
+)
+
+sum(test_sequence)
+sum(test_permutation)
+
+```
+
+#### permutation simulate test results
+
+For each season, the observed 25-at-bat rolling-BA variance is compared
+with the distribution obtained from 5,000 random permutations of the
+observed hit sequence.
+
+The permutation p-value is
+
+\[
+p_{\mathrm{perm}}
+=
+\frac{
+1+\sum_{b=1}^{B}
+I(T_{y,b}^{\mathrm{perm}}\geq T_y^{obs})
+}{
+B+1
+}.
+\]
+
+A small permutation p-value indicates that the observed temporal
+arrangement of hits produces greater rolling-performance variation than
+would typically occur under random reorderings of the same season's
+observed outcomes.
+
+```{r}
+observed_primary_variance <- observed_window_results %>%
+  filter(window == 25) %>%
+  select(
+    game_year,
+    observed_variance
+  )
+
+```
+
+```{r}
+permutation_results <- permutation_simulations %>%
+  left_join(
+    observed_primary_variance,
+    by = "game_year"
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_variance =
+      first(observed_variance),
+
+    exceedances = sum(
+      permuted_variance >=
+        observed_variance
+    ),
+
+    n_permutations = n(),
+
+    permutation_p = (
+      exceedances + 1
+    ) / (
+      n_permutations + 1
+    ),
+
+    .groups = "drop"
+  )
+
+permutation_results
+```
+
+The permutation benchmark produces conclusions similar to the primary
+i.i.d. Bernoulli analysis. In 2025, only 6 of 5,000 random reorderings
+produced a 25-at-bat rolling-BA variance at least as large as the observed
+value of 0.01455, corresponding to a corrected permutation p-value of
+approximately 0.0014.
+
+The 2022--2024 seasons were substantially less extreme under the
+permutation benchmark, with permutation p-values of approximately 0.648,
+0.147, and 0.094, respectively.
+
+Thus, the unusually large 2025 rolling-performance variation is not
+explained solely by the Bernoulli null allowing the total number of hits
+to vary across simulations. The result persists when the realized number
+of hits is held fixed and only their temporal ordering is randomized.
+
+However, the permutation benchmark still treats the temporal positions
+of the observed outcomes as exchangeable under the null and does not
+account for time-varying differences in batting context or underlying
+hit probability.
+
+### Alternative Null 2 — Context-Aware Bernoulli Null
+
+Both the season-level Bernoulli and within-season permutation benchmarks
+simplify the possibility that baseline hit probability changes across
+at-bats. In actual game data, different at-bats may occur under different
+baseball contexts.
+
+A context-aware benchmark therefore allows the baseline hit probability
+to vary across at-bats:
+
+\[
+H_i^* \sim \operatorname{Bernoulli}(\hat p_i),
+\]
+
+where
+
+\[
+\hat p_i = P(H_i = 1 \mid X_i)
+\]
+
+is estimated using contextual information available prior to the batting
+outcome.
+
+Simulated outcomes remain conditionally independent under this benchmark.
+Therefore, systematic differences in baseline opportunity or difficulty
+can be preserved while additional temporal dependence in batting outcomes
+is removed.
+
+Only variables that are available prior to the outcome are considered for
+the baseline model in order to avoid outcome leakage.
+
+```{r}
+# names(ab_data)
+```
+*check the variables -- basline model*
+
+```{r}
+ab_data %>%
+  summarise(
+    n_stand = n_distinct(stand),
+    n_p_throws = n_distinct(p_throws),
+    n_home_team = n_distinct(home_team),
+    n_away_team = n_distinct(away_team),
+    n_pitcher = n_distinct(pitcher),
+    n_inning = n_distinct(inning),
+    n_outs = n_distinct(outs_when_up)
+  )
+```
+
+*categorical distribution*
+
+```{r}
+ab_data %>%
+  count(game_year, p_throws)
+
+ab_data %>%
+  count(game_year, stand)
+
+ab_data %>%
+  count(game_year, inning_topbot)
+```
+
+*missingness*
+
+```{r}
+ab_data %>%
+  summarise(
+    missing_p_throws = sum(is.na(p_throws)),
+    missing_inning = sum(is.na(inning)),
+    missing_outs = sum(is.na(outs_when_up)),
+    missing_on_1b = sum(is.na(on_1b)),
+    missing_on_2b = sum(is.na(on_2b)),
+    missing_on_3b = sum(is.na(on_3b))
+  )
+```
+
+#### construct pre-AB context variables
+
+
+*creating the clean modeling dataset*
+
+```{r}
+context_data <- ab_data %>%
+  arrange(
+    game_year,
+    game_date,
+    game_pk,
+    at_bat_number
+  ) %>%
+  mutate(
+    pitcher_hand = factor(p_throws),
+
+    home_away = factor(
+      if_else(inning_topbot == "Bot", "Home", "Away")
+    ),
+
+    inning_group = case_when(
+      inning <= 3 ~ "Early",
+      inning <= 6 ~ "Middle",
+      TRUE ~ "Late"
+    ),
+    inning_group = factor(inning_group),
+
+    outs = factor(outs_when_up),
+
+    runner_on_1b = as.integer(!is.na(on_1b)),
+    runner_on_2b = as.integer(!is.na(on_2b)),
+    runner_on_3b = as.integer(!is.na(on_3b))
+  )
+```
+
+```{r}
+context_data %>%
+  summarise(
+    n = n(),
+    missing_hit = sum(is.na(hit)),
+    missing_pitcher_hand = sum(is.na(pitcher_hand)),
+    missing_home_away = sum(is.na(home_away)),
+    missing_inning_group = sum(is.na(inning_group)),
+    missing_outs = sum(is.na(outs)),
+    missing_runner1 = sum(is.na(runner_on_1b)),
+    missing_runner2 = sum(is.na(runner_on_2b)),
+    missing_runner3 = sum(is.na(runner_on_3b))
+  )
+```
+
+#### Context Model
+
+A logistic regression model was used to estimate an at-bat-specific
+baseline hit probability from pre-outcome contextual variables. The
+model included season, pitcher handedness, home/away status, inning
+group, outs, and base occupancy.
+
+\[
+\operatorname{logit}(p_i)
+=
+\alpha_{\text{season}(i)}
++
+\beta^\top X_i.
+\]
+
+The purpose of this model is not to interpret individual coefficients
+causally or to maximize predictive performance. Instead, it provides a
+context-adjusted estimate of the baseline hit probability for each
+official at-bat.
+
+##### fit the context-aware logistic model
+
+```{r}
+context_model <- glm(
+  hit ~ factor(game_year) +
+    pitcher_hand +
+    home_away +
+    inning_group +
+    outs +
+    runner_on_1b +
+    runner_on_2b +
+    runner_on_3b,
+  data = context_data,
+  family = binomial(link = "logit")
+)
+
+summary(context_model)
+```
+
+##### generate p_hat_i
+
+```{r}
+context_data <- context_data %>%
+  mutate(
+    predicted_hit_prob = predict(
+      context_model,
+      newdata = context_data,
+      type = "response"
+    )
+  )
+```
+
+##### check the predicted probabilities
+
+```{r}
+summary(context_data$predicted_hit_prob)
+```
+```{r}
+context_data %>%
+  summarise(
+    min_p = min(predicted_hit_prob),
+    q25_p = quantile(predicted_hit_prob, 0.25),
+    median_p = median(predicted_hit_prob),
+    mean_p = mean(predicted_hit_prob),
+    q75_p = quantile(predicted_hit_prob, 0.75),
+    max_p = max(predicted_hit_prob)
+  )
+```
+
+##### sanity check?
+
+compare the *observed season BA* VS *Average predicted probability*
+
+```{r}
+context_probability_check <- context_data %>%
+  group_by(game_year) %>%
+  summarise(
+    n_ab = n(),
+    observed_ba = mean(hit),
+    mean_predicted_p = mean(predicted_hit_prob),
+    min_predicted_p = min(predicted_hit_prob),
+    max_predicted_p = max(predicted_hit_prob),
+    .groups = "drop"
+  )
+
+context_probability_check
+```
+
+#### Context-Aware Monte Carlo Simulation
+
+```{r}
+simulate_context_variance <- function(
+  predicted_prob,
+  window = 25
+) {
+
+  simulated_hits <- rbinom(
+    n = length(predicted_prob),
+    size = 1,
+    prob = predicted_prob
+  )
+
+  simulated_rolling_ba <- zoo::rollmean(
+    simulated_hits,
+    k = window,
+    fill = NA,
+    align = "right"
+  )
+
+  var(
+    simulated_rolling_ba,
+    na.rm = TRUE
+  )
+}
+```
+
+##### save every season's probability sequence
+
+```{r}
+context_sequences <- context_data %>%
+  arrange(
+    game_year,
+    game_date,
+    game_pk,
+    at_bat_number
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    predicted_prob = list(predicted_hit_prob),
+    .groups = "drop"
+  )
+```
+
+```{r}
+context_sequences %>%
+  rowwise() %>%
+  mutate(
+    n_probabilities = length(predicted_prob)
+  ) %>%
+  select(
+    game_year,
+    n_probabilities
+  )
+```
+
+#### Context-Aware Monte Carlo Simulation
+
+Using the fitted probabilities, 5,000 simulated seasons were generated
+for each year according to
+
+\[
+H_i^* \sim \operatorname{Bernoulli}(\hat p_i).
+\]
+
+Thus, the simulated outcomes remain independent conditional on the
+selected observed contexts, while the baseline probability of a hit is
+allowed to vary across at-bats.
+
+For each simulated season, the 25-at-bat rolling batting average and its
+variance were recalculated. The observed variance was then compared with
+the resulting context-aware null distribution using the same corrected
+Monte Carlo p-value as in the primary analysis.
+
+##### run 5000 context-aware simulations per season
+
+```{r}
+set.seed(123)
+
+context_simulations <- tidyr::crossing(
+  context_sequences,
+  simulation = seq_len(n_sim)
+) %>%
+  rowwise() %>%
+  mutate(
+    simulated_variance =
+      simulate_context_variance(
+        predicted_prob = predicted_prob,
+        window = 25
+      )
+  ) %>%
+  ungroup()
+
+context_simulations
+```
+
+```{r}
+# check
+context_simulations %>%
+  count(game_year)
+```
+
+##### calculate context-aware monte carlo p-values
+
+```{r}
+context_results <- context_simulations %>%
+  left_join(
+    observed_primary_variance,
+    by = "game_year"
+  ) %>%
+  group_by(game_year) %>%
+  summarise(
+    observed_variance =
+      first(observed_variance),
+
+    exceedances = sum(
+      simulated_variance >= observed_variance
+    ),
+
+    n_simulations = n(),
+
+    context_p = (
+      exceedances + 1
+    ) / (
+      n_simulations + 1
+    ),
+
+    .groups = "drop"
+  )
+
+context_results
+```
+
+#### Context-Aware Monte Carlo Simulation
+
+Using the fitted probabilities, 5,000 simulated seasons were generated
+for each year according to
+
+\[
+H_i^* \sim \operatorname{Bernoulli}(\hat p_i).
+\]
+
+Thus, the simulated outcomes remain independent conditional on the
+selected observed contexts, while the baseline probability of a hit is
+allowed to vary across at-bats.
+
+For each simulated season, the 25-at-bat rolling batting average and its
+variance were recalculated. The observed variance was then compared with
+the resulting context-aware null distribution using the same corrected
+Monte Carlo p-value as in the primary analysis.
+
+
+##  Comparison Across Null Models
+
+```{r}
+# Finalized primary results copied from main-analysis.Rmd.
+# They are reused here to avoid rerunning the primary Monte Carlo test.
+
+primary_bernoulli_results <- tibble::tibble(
+  game_year = c(2022, 2023, 2024, 2025),
+
+  observed_variance = c(
+    0.006787898,
+    0.009979931,
+    0.010208230,
+    0.014552027
+  ),
+
+  exceedances = c(
+    3170,
+    687,
+    444,
+    0
+  ),
+
+  n_simulations = rep(5000, 4),
+
+  bernoulli_raw_p = c(
+    0.63407319,
+    0.13757249,
+    0.08898220,
+    0.00019996
+  ),
+
+  bernoulli_holm_p = c(
+    0.63407319,
+    0.27514497,
+    0.26694661,
+    0.00079984
+  )
+)
+
+primary_bernoulli_results
+```
+
+
+```{r}
+null_comparison <- primary_bernoulli_results %>%
+  select(
+    game_year,
+    observed_variance,
+    bernoulli_raw_p,
+    bernoulli_holm_p
+  ) %>%
+  left_join(
+    permutation_results %>%
+      select(
+        game_year,
+        permutation_p
+      ),
+    by = "game_year"
+  ) %>%
+  left_join(
+    context_results %>%
+      select(
+        game_year,
+        context_p
+      ),
+    by = "game_year"
+  )
+
+null_comparison
+```
+
+Across the three null specifications, the results are highly consistent.
+The 2022 and 2023 seasons do not exhibit unusually large 25-at-bat
+rolling-BA variance under any of the three benchmarks. The 2024 season
+shows moderately elevated variation, with p-values of approximately
+0.09 across all three null models, but the observed statistic is not
+especially extreme relative to the corresponding null distributions.
+
+The 2025 season produces a substantially different pattern. Its observed
+rolling-BA variance remains in the extreme upper tail under the
+season-specific Bernoulli null (\(p \approx 0.0002\)), the within-season
+permutation null (\(p \approx 0.0014\)), and the context-aware Bernoulli
+null (\(p \approx 0.0008\)). The primary Bernoulli result also remained
+statistically unusual after Holm adjustment across the four
+season-specific tests (\(p_{\mathrm{Holm}} \approx 0.0008\)).
+
+The close agreement across these alternative benchmarks indicates that
+the 2025 result is not driven solely by allowing the simulated number of
+hits to vary, by the constant season-level hit-probability assumption, or
+by the selected observed pre-outcome contextual variables included in the
+baseline model. However, these analyses establish robustness of the
+temporal-variation finding rather than a causal hot-hand mechanism.
+$$
+\hat p_i = P(Y_i=1\mid X_i).
+$$
+
+
+# Robustness Summary
+
+
+
